@@ -2,12 +2,13 @@ import assert from 'node:assert/strict';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { QueueManager, importPaths } from '../src/main/services/queue-manager.js';
 import { settingsSignature } from '../src/shared/settings.js';
 import { DEFAULT_SETTINGS, type QueueItem } from '../src/shared/types.js';
 
-const fixtureRoot = path.resolve('../lucifold/image-optimization-benchmark/fixtures/normalized');
+const fixtureRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'image-optimization-benchmark', 'fixtures', 'normalized');
 
 async function identity(filePath: string) {
   const stat = await fs.lstat(filePath);

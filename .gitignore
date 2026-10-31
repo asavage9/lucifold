@@ -18,4 +18,3 @@ image-optimization-benchmark/results/
 image-optimization-benchmark/fixtures/originals/
 .DS_Store
 *.tsbuildinfo
-src/renderer/env.d.ts

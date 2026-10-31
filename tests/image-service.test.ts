@@ -3,13 +3,14 @@ import { createHash } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import sharp from 'sharp';
 import { inspectImage, optimizeImage } from '../src/main/services/image-service.js';
 import { DEFAULT_SETTINGS } from '../src/shared/types.js';
 import type { QueueItem } from '../src/shared/types.js';
 
-const fixtureRoot = path.resolve('../lucifold/image-optimization-benchmark/fixtures/normalized');
+const fixtureRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'image-optimization-benchmark', 'fixtures', 'normalized');
 
 async function fixture(name: string): Promise<QueueItem> {
   const filePath = path.join(fixtureRoot, name);
