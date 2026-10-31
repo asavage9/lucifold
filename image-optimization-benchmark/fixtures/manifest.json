@@ -1,0 +1,54 @@
+[
+  {
+    "id": "photograph",
+    "category": "photograph",
+    "format": "jpeg",
+    "file": "image-optimization-benchmark/fixtures/normalized/photograph-source.jpg",
+    "source": "2400px normalized derivative of Fronalpstock_big.jpg from Wikimedia Commons; CC BY-SA 3.0"
+  },
+  {
+    "id": "website-graphic",
+    "category": "website graphic",
+    "format": "png",
+    "source": "generated SVG rendered locally",
+    "file": "image-optimization-benchmark/fixtures/normalized/website-graphic.png",
+    "width": 1800,
+    "height": 1100
+  },
+  {
+    "id": "gradient",
+    "category": "gradient",
+    "format": "png",
+    "source": "generated SVG rendered locally",
+    "file": "image-optimization-benchmark/fixtures/normalized/gradient.png",
+    "width": 2400,
+    "height": 1350
+  },
+  {
+    "id": "text-logo",
+    "category": "text and logo",
+    "format": "png",
+    "source": "generated SVG rendered locally",
+    "file": "image-optimization-benchmark/fixtures/normalized/text-logo.png",
+    "width": 1800,
+    "height": 900
+  },
+  {
+    "id": "screenshot-ui",
+    "category": "screenshot",
+    "format": "png",
+    "source": "generated SVG rendered locally",
+    "file": "image-optimization-benchmark/fixtures/normalized/screenshot-ui.png",
+    "width": 2000,
+    "height": 1250
+  },
+  {
+    "id": "transparent-logo",
+    "category": "transparent PNG",
+    "format": "png",
+    "source": "generated SVG rendered locally with transparent background",
+    "file": "image-optimization-benchmark/fixtures/normalized/transparent-logo.png",
+    "width": 1800,
+    "height": 1000
+  }
+]

@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 312 312" width="1024" height="1024">
+<defs>
+ <linearGradient id="left" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#25E1DC"/><stop offset="0.55" stop-color="#009FDF"/><stop offset="1" stop-color="#2367F2"/></linearGradient>
+ <linearGradient id="top" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#A5F6F6"/><stop offset="0.45" stop-color="#2BD4F0"/><stop offset="1" stop-color="#53A4FB"/></linearGradient>
+ <linearGradient id="right" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#38C4F5"/><stop offset="0.6" stop-color="#2579F8"/><stop offset="1" stop-color="#2E5AE6"/></linearGradient>
+ <linearGradient id="base" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#003B65"/><stop offset="0.6" stop-color="#053C91"/><stop offset="1" stop-color="#257CF7"/></linearGradient>
+ <linearGradient id="corner" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#FCFFFF"/><stop offset="0.6" stop-color="#C6EBFF"/><stop offset="1" stop-color="#83C6F7"/></linearGradient>
+ <linearGradient id="center" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#081B37"/><stop offset="1" stop-color="#01222F"/></linearGradient>
+ <linearGradient id="lightedge" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#FFFFFF"/><stop offset="0.55" stop-color="#DBF7FF"/><stop offset="1" stop-color="#70D7FF"/></linearGradient>
+ <filter id="glow" x="-25%" y="-25%" width="150%" height="150%"><feGaussianBlur stdDeviation="4"/></filter>
+</defs>
+<g stroke-linejoin="round">
+ <path d="M65 65 L193 65 L251 124 L251 254 L119 254 L65 196 Z" fill="none" stroke="#26B8FF" stroke-width="10" opacity=".22" filter="url(#glow)"/>
+ <path d="M65 65 L119 120 L119 254 L65 196 Z" fill="url(#left)"/>
+ <path d="M65 65 L193 65 L119 120 Z" fill="url(#top)"/>
+ <path d="M193 65 L251 124 L193 124 Z" fill="url(#corner)"/>
+ <path d="M119 120 L193 65 L193 124 L119 124 Z" fill="#2FCCC9" opacity=".85"/>
+ <path d="M119 124 L193 124 L193 197 L251 254 L119 254 Z" fill="url(#base)"/>
+ <path d="M119 124 L193 124 L193 197 Z" fill="url(#center)"/>
+ <path d="M193 124 L251 124 L251 254 L193 197 Z" fill="url(#right)"/>
+ <path d="M65 65 L119 120 L193 65 L251 124 L251 254 L119 254 L65 196 Z" fill="none" stroke="url(#lightedge)" stroke-width="4.8" stroke-linecap="round"/>
+ <path d="M119 120 L119 254 M119 120 L251 124 M193 65 L193 197 L251 254" stroke="url(#lightedge)" stroke-width="4" fill="none" stroke-linecap="round"/>
+ <path d="M119 124 L193 197" stroke="#87F0F9" stroke-width="2.2" opacity=".5"/>
+</g></svg>

@@ -1,0 +1,65 @@
+{
+  "name": "lucifold",
+  "version": "1.0.1",
+  "description": "Local-first macOS image optimization workspace.",
+  "author": "Anthony Savage",
+  "private": true,
+  "type": "module",
+  "main": "dist/main/main/main.js",
+  "scripts": {
+    "dev": "npm run build:main && npm run build:native && concurrently -k \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && cross-env ELECTRON_RENDERER_URL=http://127.0.0.1:5173 electron .\"",
+    "build": "npm run build:renderer && npm run build:preload && npm run build:main && npm run build:native",
+    "build:renderer": "vite build",
+    "build:preload": "vite build --config vite.preload.config.ts",
+    "build:main": "tsc -p tsconfig.main.json",
+    "build:native": "node scripts/build-native.mjs",
+    "start": "npm run build && electron .",
+    "test": "npm run build:native && tsx --test --test-concurrency=1 tests/*.test.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.main.json --noEmit",
+    "package:dir": "npm run build && electron-builder --mac --arm64 --dir",
+    "package:app": "npm run build && electron-builder --mac --arm64 --publish never"
+  },
+  "dependencies": {
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "sharp": "^0.35.5"
+  },
+  "devDependencies": {
+    "@types/node": "^24.9.1",
+    "@types/react": "^19.2.2",
+    "@types/react-dom": "^19.2.2",
+    "@vitejs/plugin-react": "^5.1.1",
+    "concurrently": "^9.2.1",
+    "cross-env": "^10.1.0",
+    "electron": "^45.1.0",
+    "electron-builder": "^26.0.12",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3",
+    "vite": "^8.3.5",
+    "wait-on": "^9.0.1"
+  },
+  "build": {
+    "appId": "com.lucifold.app",
+    "productName": "lucifold",
+    "asar": true,
+    "files": [
+      "dist/**/*",
+      "package.json",
+      "LICENSE_NOTICES.md"
+    ],
+    "asarUnpack": [
+      "node_modules/sharp/**/*",
+      "node_modules/@img/**/*",
+      "dist/native/**/*"
+    ],
+    "directories": {
+      "output": "release"
+    },
+    "mac": {
+      "target": ["dir"],
+      "identity": null,
+      "icon": "build/icon.png",
+      "category": "public.app-category.graphics-design"
+    }
+  }
+}
