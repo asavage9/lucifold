@@ -210,6 +210,7 @@ test('real local Git fixture discovers an annotated newer tag and verifies its p
     tempPath: root,
     sourceCandidates: [],
     expectedOrigin: remote,
+    trustedReleaseSigningKey: null,
   });
   assert.equal((await unconfiguredTrustService.checkForUpdates(source)).state, 'up-to-date');
   await fs.rm(root, { recursive: true, force: true });

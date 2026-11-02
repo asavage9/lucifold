@@ -10,13 +10,13 @@ import type { UpdateCheckResult, UpdateProgress, UpdateStatusRecord } from '../.
  * A future approved build must replace this with the exact HTTPS/SSH origin;
  * the updater must never infer a production source from shotset or a UI path.
  */
-export const APPROVED_LUCIFOLD_ORIGIN: string | null = null;
+export const APPROVED_LUCIFOLD_ORIGIN = 'https://github.com/asavage9/lucifold.git';
 /**
  * A future updater-enabled release must replace this with Anthony's
  * independently verified SSH release-signing public key. Keeping it unset in
  * the everyday build makes signed-release verification fail closed.
  */
-export const APPROVED_LUCIFOLD_RELEASE_SIGNING_KEY: string | null = null;
+export const APPROVED_LUCIFOLD_RELEASE_SIGNING_KEY = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGlkdfd6tPwtF57kqCzbkq+49Ryz3zwJIeQ5OMPEZMlf lucifold-release';
 export const APPROVED_LUCIFOLD_RELEASE_SIGNING_PRINCIPAL = 'lucifold-release';
 export const UPDATE_TAG_PATTERN = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 export const UPDATE_PLAN_VERSION = 2;
