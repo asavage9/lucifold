@@ -15,6 +15,20 @@ async function runGit(cwd: string, args: string[]): Promise<void> {
   await execFile('git', args, { cwd });
 }
 
+async function createSshSigningKey(root: string, name = 'release-key'): Promise<{ privateKey: string; publicKey: string }> {
+  const privateKey = path.join(root, name);
+  await execFile('/usr/bin/ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-C', 'lucifold-release', '-f', privateKey]);
+  return { privateKey, publicKey: (await fs.readFile(`${privateKey}.pub`, 'utf8')).trim() };
+}
+
+async function configureSshSigning(source: string, privateKey: string, publicKey: string, allowedSignersPath: string, principal = 'lucifold-release'): Promise<void> {
+  await runGit(source, ['config', 'user.email', principal]);
+  await runGit(source, ['config', 'gpg.format', 'ssh']);
+  await runGit(source, ['config', 'user.signingKey', privateKey]);
+  await fs.writeFile(allowedSignersPath, `${principal} namespaces="git" ${publicKey}\n`, { mode: 0o600 });
+  await runGit(source, ['config', 'gpg.ssh.allowedSignersFile', allowedSignersPath]);
+}
+
 async function temporaryDirectory(prefix: string): Promise<string> {
   return fs.mkdtemp(path.join(os.tmpdir(), prefix));
 }
@@ -89,7 +103,7 @@ test('update validation accepts only stable tags and strict path containment', (
   assert.equal(isPathWithin('/tmp/lucifold-update-1', '/tmp/lucifold-update-1'), false);
 });
 
-test('real local Git fixture discovers an approved newer lucifold tag after fetch', async () => {
+test('real local Git fixture rejects an unsigned lightweight tag after fetch', async () => {
   const root = await temporaryDirectory('lucifold-update-git-');
   const remote = path.join(root, 'remote.git');
   const source = path.join(root, 'source');
@@ -121,10 +135,239 @@ test('real local Git fixture discovers an approved newer lucifold tag after fetc
     expectedOrigin: remote,
   });
   const result = await service.checkForUpdates(source);
-  assert.equal(result.state, 'available');
-  assert.equal(result.tag, 'v1.0.1');
-  assert.equal(result.latestVersion, '1.0.1');
+  assert.equal(result.state, 'up-to-date');
+  assert.equal(result.tag, undefined);
+  assert.equal(result.latestVersion, undefined);
   assert.equal(result.canInstall, false);
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test('real local Git fixture discovers an annotated newer tag and verifies its peeled commit', async () => {
+  const root = await temporaryDirectory('lucifold-update-annotated-git-');
+  const remote = path.join(root, 'remote.git');
+  const source = path.join(root, 'source');
+  await fs.mkdir(source, { recursive: true });
+  await execFile('git', ['init', '--bare', remote]);
+  await execFile('git', ['init', '-q'], { cwd: source });
+  await runGit(source, ['config', 'user.email', 'lucifold-release']);
+  await runGit(source, ['config', 'user.name', 'lucifold tests']);
+  await runGit(source, ['remote', 'add', 'origin', remote]);
+  const signingKey = await createSshSigningKey(root);
+  await configureSshSigning(source, signingKey.privateKey, signingKey.publicKey, path.join(root, 'allowed-signers'));
+  await fs.writeFile(path.join(source, 'package.json'), JSON.stringify({ name: 'lucifold', version: '1.0.1' }));
+  await runGit(source, ['add', 'package.json']);
+  await runGit(source, ['commit', '-q', '-m', 'v1.0.1']);
+  await runGit(source, ['tag', 'v1.0.1']);
+  await fs.writeFile(path.join(source, 'package.json'), JSON.stringify({ name: 'lucifold', version: '1.0.2' }));
+  await runGit(source, ['add', 'package.json']);
+  await runGit(source, ['commit', '-q', '-m', 'v1.0.2']);
+  await runGit(source, ['tag', '-s', 'v1.0.2', '-m', 'lucifold v1.0.2']);
+  await runGit(source, ['push', '-q', '--all', 'origin']);
+  await runGit(source, ['push', '-q', '--tags', 'origin']);
+  await runGit(source, ['tag', '-d', 'v1.0.2']);
+
+  const directListing = (await execFile('git', ['ls-remote', '--tags', remote, 'refs/tags/v1.0.2'])).stdout.trim();
+  const fullListing = (await execFile('git', ['ls-remote', '--tags', remote, 'refs/tags/v1.0.2', 'refs/tags/v1.0.2^{}'])).stdout.trim().split(/\r?\n/);
+  const directObject = directListing.split(/\s+/)[0];
+  const peeledCommit = fullListing.find((line) => line.endsWith('refs/tags/v1.0.2^{}'))?.split(/\s+/)[0];
+  assert.match(directObject, /^[0-9a-f]{40}$/i);
+  assert.match(peeledCommit ?? '', /^[0-9a-f]{40}$/i);
+  assert.notEqual(directObject, peeledCommit);
+
+  const service = new UpdateService({
+    currentVersion: '1.0.1',
+    packaged: false,
+    currentExecutable: '/tmp/lucifold',
+    userDataPath: path.join(root, 'data'),
+    tempPath: root,
+    sourceCandidates: [],
+    expectedOrigin: remote,
+    trustedReleaseSigningKey: signingKey.publicKey,
+    trustedReleaseSigningPrincipal: 'lucifold-release',
+  });
+  const result = await service.checkForUpdates(source);
+  assert.equal(result.state, 'available');
+  assert.equal(result.tag, 'v1.0.2');
+  assert.equal(result.latestVersion, '1.0.2');
+  const untrustedKey = await createSshSigningKey(root, 'untrusted-release-key');
+  const untrustedService = new UpdateService({
+    currentVersion: '1.0.1',
+    packaged: false,
+    currentExecutable: '/tmp/lucifold',
+    userDataPath: path.join(root, 'untrusted-data'),
+    tempPath: root,
+    sourceCandidates: [],
+    expectedOrigin: remote,
+    trustedReleaseSigningKey: untrustedKey.publicKey,
+    trustedReleaseSigningPrincipal: 'lucifold-release',
+  });
+  assert.equal((await untrustedService.checkForUpdates(source)).state, 'up-to-date');
+  const unconfiguredTrustService = new UpdateService({
+    currentVersion: '1.0.1',
+    packaged: false,
+    currentExecutable: '/tmp/lucifold',
+    userDataPath: path.join(root, 'unconfigured-data'),
+    tempPath: root,
+    sourceCandidates: [],
+    expectedOrigin: remote,
+  });
+  assert.equal((await unconfiguredTrustService.checkForUpdates(source)).state, 'up-to-date');
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test('signed-tag verification pins trusted ssh-keygen against local and inherited Git overrides', async () => {
+  const root = await temporaryDirectory('lucifold-update-verifier-override-');
+  const remote = path.join(root, 'remote.git');
+  const source = path.join(root, 'source');
+  const marker = path.join(root, 'untrusted-verifier-ran');
+  await fs.mkdir(source, { recursive: true });
+  await execFile('git', ['init', '--bare', remote]);
+  await execFile('git', ['init', '-q'], { cwd: source });
+  await runGit(source, ['config', 'user.email', 'lucifold-release']);
+  await runGit(source, ['config', 'user.name', 'lucifold tests']);
+  await runGit(source, ['remote', 'add', 'origin', remote]);
+  const signingKey = await createSshSigningKey(root);
+  await configureSshSigning(source, signingKey.privateKey, signingKey.publicKey, path.join(root, 'allowed-signers'));
+  await fs.writeFile(path.join(source, 'package.json'), JSON.stringify({ name: 'lucifold', version: '1.0.1' }));
+  await runGit(source, ['add', 'package.json']);
+  await runGit(source, ['commit', '-q', '-m', 'v1.0.1']);
+  await runGit(source, ['tag', 'v1.0.1']);
+  await fs.writeFile(path.join(source, 'package.json'), JSON.stringify({ name: 'lucifold', version: '1.0.2' }));
+  await runGit(source, ['add', 'package.json']);
+  await runGit(source, ['commit', '-q', '-m', 'v1.0.2']);
+  await runGit(source, ['tag', '-s', 'v1.0.2', '-m', 'lucifold v1.0.2']);
+  await runGit(source, ['push', '-q', '--all', 'origin']);
+  await runGit(source, ['push', '-q', '--tags', 'origin']);
+  await runGit(source, ['tag', '-d', 'v1.0.2']);
+
+  const untrustedVerifier = path.join(root, 'untrusted-ssh-keygen');
+  await fs.writeFile(untrustedVerifier, `#!/bin/sh\nprintf 'ran' > ${marker}\nexit 1\n`);
+  await fs.chmod(untrustedVerifier, 0o700);
+  await runGit(source, ['config', 'gpg.ssh.program', untrustedVerifier]);
+
+  const previousEnvironment = {
+    GIT_CONFIG_COUNT: process.env.GIT_CONFIG_COUNT,
+    GIT_CONFIG_KEY_0: process.env.GIT_CONFIG_KEY_0,
+    GIT_CONFIG_VALUE_0: process.env.GIT_CONFIG_VALUE_0,
+  };
+  process.env.GIT_CONFIG_COUNT = '1';
+  process.env.GIT_CONFIG_KEY_0 = 'gpg.ssh.program';
+  process.env.GIT_CONFIG_VALUE_0 = untrustedVerifier;
+  try {
+    const service = new UpdateService({
+      currentVersion: '1.0.1',
+      packaged: false,
+      currentExecutable: '/tmp/lucifold',
+      userDataPath: path.join(root, 'data'),
+      tempPath: root,
+      sourceCandidates: [],
+      expectedOrigin: remote,
+      trustedReleaseSigningKey: signingKey.publicKey,
+      trustedReleaseSigningPrincipal: 'lucifold-release',
+    });
+    const result = await service.checkForUpdates(source);
+    assert.equal(result.state, 'available');
+    assert.equal(result.tag, 'v1.0.2');
+    assert.equal(await fs.access(marker).then(() => true).catch(() => false), false);
+  } finally {
+    for (const [key, value] of Object.entries(previousEnvironment)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test('invalid or unavailable trusted release verifier configuration fails closed', async () => {
+  const root = await temporaryDirectory('lucifold-update-invalid-verifier-');
+  const expectedOrigin = 'https://github.com/example/lucifold.git';
+  await fs.writeFile(path.join(root, 'package.json'), JSON.stringify({ name: 'lucifold', version: '1.0.1' }));
+  const runner: CommandRunner = async (command, args) => {
+    if (command !== 'git') return { stdout: 'tool\n', stderr: '' };
+    if (args[0] === '--version') return { stdout: 'git version 2.50.0\n', stderr: '' };
+    if (args[0] === 'rev-parse' && args[1] === '--show-toplevel') return { stdout: `${root}\n`, stderr: '' };
+    if (args[0] === 'config' && args[3] === 'remote.origin.url') return { stdout: `${expectedOrigin}\n`, stderr: '' };
+    if (args[0] === 'config' && args[2] === '--get-regexp') return { stdout: '\n', stderr: '' };
+    if (args[0] === 'status') return { stdout: '', stderr: '' };
+    if (args[0] === 'tag' && args[1] === '--list') return { stdout: 'v1.0.2\n', stderr: '' };
+    if (args[0] === 'show') return { stdout: JSON.stringify({ name: 'lucifold', version: '1.0.2' }), stderr: '' };
+    if (args[0] === 'ls-remote') return { stdout: `${'a'.repeat(40)}\trefs/tags/v1.0.2\n${'b'.repeat(40)}\trefs/tags/v1.0.2^{}\n`, stderr: '' };
+    if (args[0] === 'rev-parse' && args[1] === 'v1.0.2') return { stdout: `${'a'.repeat(40)}\n`, stderr: '' };
+    if (args[0] === 'cat-file') return { stdout: 'tag\n', stderr: '' };
+    if (args[0] === 'rev-parse' && args[1] === 'v1.0.2^{commit}') return { stdout: `${'b'.repeat(40)}\n`, stderr: '' };
+    return { stdout: '', stderr: '' };
+  };
+  const service = new UpdateService({ currentVersion: '1.0.1', packaged: false, currentExecutable: '/tmp/lucifold', userDataPath: path.join(root, 'data'), tempPath: root, sourceCandidates: [], expectedOrigin, commandRunner: runner, trustedReleaseSigningKey: 'not-an-ssh-ed25519-key' });
+  assert.equal((await service.checkForUpdates(root)).state, 'up-to-date');
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test('real local Git fixture rejects unsigned annotated tags before update discovery', async () => {
+  const root = await temporaryDirectory('lucifold-update-unsigned-annotated-');
+  const remote = path.join(root, 'remote.git');
+  const source = path.join(root, 'source');
+  await fs.mkdir(source, { recursive: true });
+  await execFile('git', ['init', '--bare', remote]);
+  await execFile('git', ['init', '-q'], { cwd: source });
+  await runGit(source, ['config', 'user.email', 'lucifold-release']);
+  await runGit(source, ['config', 'user.name', 'lucifold tests']);
+  await runGit(source, ['remote', 'add', 'origin', remote]);
+  const signingKey = await createSshSigningKey(root);
+  await fs.writeFile(path.join(source, 'package.json'), JSON.stringify({ name: 'lucifold', version: '1.0.1' }));
+  await runGit(source, ['add', 'package.json']);
+  await runGit(source, ['commit', '-q', '-m', 'v1.0.1']);
+  await runGit(source, ['tag', 'v1.0.1']);
+  await fs.writeFile(path.join(source, 'package.json'), JSON.stringify({ name: 'lucifold', version: '1.0.2' }));
+  await runGit(source, ['add', 'package.json']);
+  await runGit(source, ['commit', '-q', '-m', 'v1.0.2']);
+  await runGit(source, ['tag', '-a', 'v1.0.2', '-m', 'lucifold v1.0.2']);
+  await runGit(source, ['push', '-q', '--all', 'origin']);
+  await runGit(source, ['push', '-q', '--tags', 'origin']);
+  await runGit(source, ['tag', '-d', 'v1.0.2']);
+
+  const service = new UpdateService({
+    currentVersion: '1.0.1',
+    packaged: false,
+    currentExecutable: '/tmp/lucifold',
+    userDataPath: path.join(root, 'data'),
+    tempPath: root,
+    sourceCandidates: [],
+    expectedOrigin: remote,
+    trustedReleaseSigningKey: signingKey.publicKey,
+    trustedReleaseSigningPrincipal: 'lucifold-release',
+  });
+  assert.equal((await service.checkForUpdates(source)).state, 'up-to-date');
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test('annotated tag verification rejects missing, malformed, ambiguous, and mismatched remote references', async () => {
+  const root = await temporaryDirectory('lucifold-update-tag-references-');
+  const expectedOrigin = 'https://github.com/example/lucifold.git';
+  await fs.writeFile(path.join(root, 'package.json'), JSON.stringify({ name: 'lucifold', version: '1.0.2' }));
+
+  const check = async (remoteListing: string): Promise<ReturnType<UpdateService['checkForUpdates']>> => {
+    const runner: CommandRunner = async (command, args) => {
+      if (command !== 'git') return { stdout: 'tool\n', stderr: '' };
+      if (args[0] === 'rev-parse' && args[1] === '--show-toplevel') return { stdout: `${root}\n`, stderr: '' };
+      if (args[0] === 'config' && args[3] === 'remote.origin.url') return { stdout: `${expectedOrigin}\n`, stderr: '' };
+      if (args[0] === 'config' && args[2] === '--get-regexp') return { stdout: '\n', stderr: '' };
+      if (args[0] === 'status') return { stdout: '', stderr: '' };
+      if (args[0] === 'tag' && args[1] === '--list') return { stdout: 'v1.0.2\n', stderr: '' };
+      if (args[0] === 'show') return { stdout: JSON.stringify({ name: 'lucifold', version: '1.0.2' }), stderr: '' };
+      if (args[0] === 'ls-remote') return { stdout: remoteListing, stderr: '' };
+      if (args[0] === 'rev-parse' && args[1] === 'v1.0.2^{commit}') return { stdout: `${'b'.repeat(40)}\n`, stderr: '' };
+      return { stdout: '', stderr: '' };
+    };
+    const service = new UpdateService({ currentVersion: '1.0.1', packaged: false, currentExecutable: '/tmp/lucifold', userDataPath: path.join(root, 'data'), tempPath: root, sourceCandidates: [], expectedOrigin, commandRunner: runner });
+    return service.checkForUpdates(root);
+  };
+
+  const direct = 'a'.repeat(40);
+  const peeled = 'c'.repeat(40);
+  assert.equal((await check('')).state, 'up-to-date');
+  assert.equal((await check(`not-a-sha\trefs/tags/v1.0.2\n`)).state, 'up-to-date');
+  assert.equal((await check(`${direct}\trefs/tags/v1.0.2\n${direct}\trefs/tags/v1.0.2\n${peeled}\trefs/tags/v1.0.2^{}\n`)).state, 'up-to-date');
+  assert.equal((await check(`${direct}\trefs/tags/v1.0.2\n${peeled}\trefs/tags/v1.0.2^{}\n`)).state, 'up-to-date');
   await fs.rm(root, { recursive: true, force: true });
 });
 
@@ -164,6 +407,55 @@ test('release identity checks ignore local-only tags, URL rewrites, and substitu
 
   const unexpectedOrigin = await new UpdateService({ currentVersion: '1.0.1', packaged: false, currentExecutable: '/tmp/lucifold', userDataPath: path.join(root, 'data'), tempPath: root, sourceCandidates: [], expectedOrigin: 'https://github.com/other/lucifold.git', commandRunner: cleanRunner }).validateSourceRepository(root);
   assert.equal(unexpectedOrigin.ok, false);
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test('signature verification failure stops before source build or helper launch', async () => {
+  const root = await temporaryDirectory('lucifold-update-signature-failure-');
+  const signingKey = await createSshSigningKey(root);
+  const expectedOrigin = 'https://github.com/example/lucifold.git';
+  const direct = 'a'.repeat(40);
+  const peeled = 'b'.repeat(40);
+  await fs.writeFile(path.join(root, 'package.json'), JSON.stringify({ name: 'lucifold', version: '1.0.1' }));
+  const commands: Array<{ command: string; args: string[] }> = [];
+  const runner: CommandRunner = async (command, args) => {
+    commands.push({ command, args });
+    if (command !== 'git') return { stdout: 'tool\n', stderr: '' };
+    if (args[0] === 'rev-parse' && args[1] === '--show-toplevel') return { stdout: `${root}\n`, stderr: '' };
+    if (args[0] === 'config' && args[3] === 'remote.origin.url') return { stdout: `${expectedOrigin}\n`, stderr: '' };
+    if (args[0] === 'config' && args[2] === '--get-regexp') return { stdout: '\n', stderr: '' };
+    if (args[0] === 'status') return { stdout: '', stderr: '' };
+    if (args[0] === 'ls-remote') return { stdout: `${direct}\trefs/tags/v1.0.2\n${peeled}\trefs/tags/v1.0.2^{}\n`, stderr: '' };
+    if (args[0] === 'rev-parse' && args[1] === 'v1.0.2') return { stdout: `${direct}\n`, stderr: '' };
+    if (args[0] === 'cat-file') return { stdout: 'tag\n', stderr: '' };
+    if (args[0] === 'rev-parse' && args[1] === 'v1.0.2^{commit}') return { stdout: `${peeled}\n`, stderr: '' };
+    if (args.includes('verify-tag')) throw new Error('invalid signature');
+    return { stdout: '', stderr: '' };
+  };
+  let helperLaunched = false;
+  const service = new UpdateService({
+    currentVersion: '1.0.1',
+    packaged: true,
+    currentAppPath: path.join(root, 'installed', 'lucifold.app'),
+    currentExecutable: '/tmp/lucifold',
+    userDataPath: path.join(root, 'data'),
+    tempPath: root,
+    sourceCandidates: [],
+    expectedOrigin,
+    commandRunner: runner,
+    helperLauncher: () => { helperLaunched = true; },
+    trustedReleaseSigningKey: signingKey.publicKey,
+    trustedReleaseSigningPrincipal: 'lucifold-release',
+  });
+  const result = await service.prepareAndInstall('v1.0.2', root, () => undefined);
+  assert.equal(result.accepted, false);
+  assert.match(result.message, /not signed|could not be staged/i);
+  assert.equal(helperLaunched, false);
+  assert.equal(commands.some(({ command, args }) => command === 'npm' && (args[0] === 'ci' || args[0] === 'run')), false);
+  const verificationCommand = commands.find(({ command, args }) => command === 'git' && args.includes('verify-tag'));
+  assert.ok(verificationCommand);
+  assert.ok(verificationCommand.args.some((arg) => arg.startsWith('gpg.ssh.program=/usr/bin/ssh-keygen')));
+  assert.equal(verificationCommand.args.includes('gpg.ssh.revocationFile=/dev/null'), false);
   await fs.rm(root, { recursive: true, force: true });
 });
 

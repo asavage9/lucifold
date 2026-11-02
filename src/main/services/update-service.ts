@@ -11,6 +11,13 @@ import type { UpdateCheckResult, UpdateProgress, UpdateStatusRecord } from '../.
  * the updater must never infer a production source from shotset or a UI path.
  */
 export const APPROVED_LUCIFOLD_ORIGIN: string | null = null;
+/**
+ * A future updater-enabled release must replace this with Anthony's
+ * independently verified SSH release-signing public key. Keeping it unset in
+ * the everyday build makes signed-release verification fail closed.
+ */
+export const APPROVED_LUCIFOLD_RELEASE_SIGNING_KEY: string | null = null;
+export const APPROVED_LUCIFOLD_RELEASE_SIGNING_PRINCIPAL = 'lucifold-release';
 export const UPDATE_TAG_PATTERN = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 export const UPDATE_PLAN_VERSION = 2;
 const COMMAND_TIMEOUT = 15 * 60 * 1_000;
@@ -23,6 +30,7 @@ const CONTROLLED_EXECUTABLES: Record<string, string[]> = {
   node: ['/usr/local/bin/node', '/opt/homebrew/bin/node', '/usr/bin/node'],
   npm: ['/usr/local/bin/npm', '/opt/homebrew/bin/npm', '/usr/bin/npm'],
   tar: ['/usr/bin/tar', '/usr/bin/bsdtar', '/opt/homebrew/bin/bsdtar'],
+  'ssh-keygen': ['/usr/bin/ssh-keygen'],
 };
 
 export interface CommandResult {
@@ -39,6 +47,11 @@ export interface RepositoryInspection {
   packageVersion: string;
   dirty: boolean;
   identity: string;
+}
+
+interface RemoteTagReferences {
+  direct: string;
+  peeled: string;
 }
 
 export interface UpdatePlan {
@@ -71,6 +84,9 @@ export interface UpdateServiceOptions {
   commandRunner?: CommandRunner;
   helperLauncher?: HelperLauncher;
   processId?: number;
+  /** Test-only dependency injection for disposable signing identities. */
+  trustedReleaseSigningKey?: string | null;
+  trustedReleaseSigningPrincipal?: string;
 }
 
 export class UpdateService {
@@ -314,12 +330,18 @@ export class UpdateService {
     if (!inspection.valid || !isExpectedOrigin(inspection.repository.origin, this.options.expectedOrigin)) {
       throw new Error('The source repository origin is no longer the approved lucifold update source.');
     }
-    const remoteCommit = await this.remoteTagCommit(root, tag, this.options.expectedOrigin);
-    if (!remoteCommit) return null;
+    const remoteReferences = await this.remoteTagReferences(root, tag, this.options.expectedOrigin);
+    if (!remoteReferences) return null;
+    const localTagObject = (await this.runCommand('git', ['rev-parse', tag], root, COMMAND_TIMEOUT)).stdout.trim();
+    const localTagType = (await this.runCommand('git', ['cat-file', '-t', tag], root, COMMAND_TIMEOUT)).stdout.trim();
+    if (!/^[0-9a-f]{40}$/i.test(localTagObject) || localTagObject.toLowerCase() !== remoteReferences.direct.toLowerCase() || localTagType !== 'tag') {
+      throw new Error(`The approved release tag ${tag} does not match the current remote tag object.`);
+    }
     const localCommit = (await this.runCommand('git', ['rev-parse', `${tag}^{commit}`], root, COMMAND_TIMEOUT)).stdout.trim();
-    if (!/^[0-9a-f]{40}$/i.test(localCommit) || localCommit.toLowerCase() !== remoteCommit.toLowerCase()) {
+    if (!/^[0-9a-f]{40}$/i.test(localCommit) || localCommit.toLowerCase() !== remoteReferences.peeled.toLowerCase()) {
       throw new Error(`The approved release tag ${tag} does not resolve to the current remote commit.`);
     }
+    await this.verifyReleaseTagSignature(root, tag);
     return localCommit;
   }
 
@@ -330,13 +352,60 @@ export class UpdateService {
     }
   }
 
-  private async remoteTagCommit(root: string, tag: string, approvedOrigin: string): Promise<string | null> {
-    const listing = await this.runCommand('git', ['ls-remote', '--tags', approvedOrigin, `refs/tags/${tag}`], root, COMMAND_TIMEOUT);
-    const records = listing.stdout.split(/\r?\n/).map((line) => line.trim().split(/\s+/)).filter((parts) => parts.length >= 2);
-    const peeled = records.find((parts) => parts[1] === `refs/tags/${tag}^{}`)?.[0];
-    const direct = records.find((parts) => parts[1] === `refs/tags/${tag}`)?.[0];
-    const commit = peeled ?? direct;
-    return commit && /^[0-9a-f]{40}$/i.test(commit) ? commit : null;
+  private async remoteTagReferences(root: string, tag: string, approvedOrigin: string): Promise<RemoteTagReferences | null> {
+    const directReference = `refs/tags/${tag}`;
+    const peeledReference = `${directReference}^{}`;
+    const listing = await this.runCommand('git', ['ls-remote', '--tags', approvedOrigin, directReference, peeledReference], root, COMMAND_TIMEOUT);
+    const records = listing.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).map((line) => {
+      const parts = line.split(/\s+/);
+      return parts.length === 2 ? { sha: parts[0], reference: parts[1] } : null;
+    });
+    if (records.some((record) => !record)) return null;
+
+    const directRecords = records.filter((record): record is { sha: string; reference: string } => record?.reference === directReference);
+    const peeledRecords = records.filter((record): record is { sha: string; reference: string } => record?.reference === peeledReference);
+    if (records.some((record) => record && record.reference !== directReference && record.reference !== peeledReference)) return null;
+    if (directRecords.length > 1 || peeledRecords.length > 1) return null;
+
+    const direct = directRecords[0]?.sha;
+    const peeled = peeledRecords[0]?.sha;
+    if (direct && !/^[0-9a-f]{40}$/i.test(direct)) return null;
+    if (peeled && !/^[0-9a-f]{40}$/i.test(peeled)) return null;
+    if (!direct || !peeled || direct === peeled) return null;
+    return { direct, peeled };
+  }
+
+  private async verifyReleaseTagSignature(root: string, tag: string): Promise<void> {
+    const signingKey = this.options.trustedReleaseSigningKey === undefined
+      ? APPROVED_LUCIFOLD_RELEASE_SIGNING_KEY
+      : this.options.trustedReleaseSigningKey;
+    const principal = this.options.trustedReleaseSigningPrincipal ?? APPROVED_LUCIFOLD_RELEASE_SIGNING_PRINCIPAL;
+    if (!signingKey || !isValidReleaseSigningKey(signingKey) || !isValidReleaseSigningPrincipal(principal)) {
+      throw new Error('The updater has no valid independently trusted lucifold release-signing identity configured.');
+    }
+
+    const trustedVerifier = await resolveControlledExecutable('ssh-keygen');
+    await fs.mkdir(this.options.tempPath, { recursive: true, mode: 0o700 });
+    const verificationRoot = await fs.mkdtemp(path.join(this.options.tempPath, 'lucifold-signature-'));
+    const allowedSignersPath = path.join(verificationRoot, 'allowed-signers');
+    const revocationPath = path.join(verificationRoot, 'revoked-keys');
+    try {
+      await writeDurableFile(allowedSignersPath, `${principal} namespaces="git" ${signingKey.trim()}\n`);
+      await writeDurableFile(revocationPath, '');
+      try {
+        await this.runCommand('git', [
+          '-c', 'gpg.format=ssh',
+          `-c`, `gpg.ssh.program=${trustedVerifier}`,
+          '-c', `gpg.ssh.allowedSignersFile=${allowedSignersPath}`,
+          '-c', `gpg.ssh.revocationFile=${revocationPath}`,
+          'verify-tag', '--', tag,
+        ], root, COMMAND_TIMEOUT);
+      } catch {
+        throw new Error('The approved release tag is not signed by the trusted lucifold release identity.');
+      }
+    } finally {
+      await fs.rm(verificationRoot, { recursive: true, force: true }).catch(() => undefined);
+    }
   }
 
   private async extractVerifiedArchive(archivePath: string, sourceRoot: string): Promise<void> {
@@ -663,6 +732,14 @@ function parseVersion(value: string): [number, number, number] | null {
 
 function normalizeOrigin(origin: string): string {
   return origin.trim().replace(/\.git$/i, '').replace(/\/$/, '').toLowerCase();
+}
+
+function isValidReleaseSigningKey(value: string): boolean {
+  return /^ssh-ed25519\s+[A-Za-z0-9+/=]+(?:\s+[^\r\n]*)?$/.test(value.trim());
+}
+
+function isValidReleaseSigningPrincipal(value: string): boolean {
+  return /^[A-Za-z0-9._@+-]+$/.test(value);
 }
 
 function commandFailureMessage(error: unknown, fallback: string): string {
