@@ -1,4 +1,4 @@
-import { constants as fsConstants, promises as fs } from 'node:fs';
+import { constants as fsConstants, promises as fs, readFileSync, lstatSync } from 'node:fs';
 import { execFile, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import os from 'node:os';
@@ -681,6 +681,23 @@ export async function markUpdateVerified(statusPath: string, expectedVersion: st
   if (expectedIdentity !== await applicationIdentity(currentAppPath)) return false;
   await writeUpdateStatus(statusPath, { state: 'verified', version: expectedVersion, message: `lucifold ${expectedVersion} started successfully after update.`, timestamp: new Date().toISOString(), backupPath: current.backupPath, lockPath: current.lockPath, stagingRoot: current.stagingRoot, targetAppPath: current.targetAppPath, transactionId: current.transactionId, applicationIdentity: current.applicationIdentity, knownGoodApplicationIdentity: current.knownGoodApplicationIdentity });
   return true;
+}
+
+export function resolveVerificationUserDataPath(statusPath: string, expectedVersion: string, expectedIdentity: string, currentAppPath: string, requestedPath?: string): string | null {
+  if (!path.isAbsolute(statusPath) || path.basename(statusPath) !== 'update-status.json' || !isApprovedTag(`v${expectedVersion}`) || !/^[0-9a-f]{64}$/i.test(expectedIdentity) || !path.isAbsolute(currentAppPath)) return null;
+  let status: UpdateStatusRecord;
+  try {
+    const statusStat = lstatSync(statusPath);
+    const userDataStat = lstatSync(path.dirname(statusPath));
+    if (!statusStat.isFile() || statusStat.isSymbolicLink() || !userDataStat.isDirectory() || userDataStat.isSymbolicLink()) return null;
+    status = JSON.parse(readFileSync(statusPath, 'utf8')) as UpdateStatusRecord;
+  } catch {
+    return null;
+  }
+  const userDataPath = path.dirname(statusPath);
+  if (!path.isAbsolute(userDataPath) || path.resolve(userDataPath) === path.parse(userDataPath).root || status.state !== 'pending' || status.version !== expectedVersion || status.targetAppPath !== path.resolve(currentAppPath) || status.applicationIdentity !== expectedIdentity || !status.transactionId || !/^[0-9a-f-]{36}$/i.test(status.transactionId)) return null;
+  if (requestedPath !== undefined && (!path.isAbsolute(requestedPath) || path.resolve(requestedPath) !== path.resolve(userDataPath))) return null;
+  return userDataPath;
 }
 
 async function assertPackageVersion(sourceRoot: string, expectedVersion: string): Promise<void> {

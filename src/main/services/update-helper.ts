@@ -24,7 +24,7 @@ export async function runUpdateHelper(planPath: string, options: { startupVerify
     await movePath(plan.targetAppPath, plan.backupPath);
     await movePath(plan.stagedAppPath, plan.targetAppPath);
     await assertApplicationBundle(plan.targetAppPath);
-    launchInstalledApp(plan.targetExecutable, ['--lucifold-update-verify', plan.statusPath, plan.newVersion, plan.expectedAppIdentity!]);
+    launchInstalledApp(plan.targetExecutable, ['--user-data-dir', plan.userDataPath, '--lucifold-update-verify', plan.statusPath, plan.newVersion, plan.expectedAppIdentity!]);
     await waitForVerifiedStatus(plan.statusPath, plan.newVersion, options.startupVerifyTimeout ?? STARTUP_VERIFY_TIMEOUT);
     await writeUpdateStatus(plan.statusPath, { state: 'installed', version: plan.newVersion, message: `lucifold ${plan.newVersion} installed and verified successfully.`, timestamp: new Date().toISOString(), backupPath: plan.backupPath, lockPath: plan.lockPath, stagingRoot: plan.stagingRoot, targetAppPath: plan.targetAppPath, transactionId: plan.transactionId, applicationIdentity: plan.expectedAppIdentity, knownGoodApplicationIdentity: plan.knownGoodApplicationIdentity });
     await fs.rm(plan.backupRoot, { recursive: true, force: true }).catch(() => undefined);

@@ -7,7 +7,7 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import test from 'node:test';
 import { performInstallationForTest, recoverInterruptedUpdate, runUpdateHelper } from '../src/main/services/update-helper.js';
-import { applicationIdentity, compareVersions, extractVerifiedArchiveForTest, isApprovedTag, isExpectedOrigin, isPathWithin, readUpdateStatus, validateArchiveEntries, writeUpdateStatus, UpdateService, type CommandRunner, type UpdatePlan } from '../src/main/services/update-service.js';
+import { applicationIdentity, compareVersions, extractVerifiedArchiveForTest, isApprovedTag, isExpectedOrigin, isPathWithin, readUpdateStatus, resolveVerificationUserDataPath, validateArchiveEntries, writeUpdateStatus, UpdateService, type CommandRunner, type UpdatePlan } from '../src/main/services/update-service.js';
 
 const execFile = promisify(execFileCallback);
 
@@ -56,7 +56,7 @@ function verificationScript(mode: 'success' | 'fail' | 'remove-backup' | 'sleep'
   const code = mode === 'success'
     ? 'const fs=require("fs");const p=process.argv[1];const s=JSON.parse(fs.readFileSync(p,"utf8"));s.state="verified";s.version=process.argv[2];fs.writeFileSync(p,JSON.stringify(s));'
     : 'const fs=require("fs");const p=process.argv[1];const s=JSON.parse(fs.readFileSync(p,"utf8"));fs.rmSync(s.backupPath,{recursive:true,force:true});';
-  return `STATUS="$2"\nVERSION="$3"\n${process.execPath} -e '${code}' "$STATUS" "$VERSION"`;
+  return `STATUS="$4"\nVERSION="$5"\n${process.execPath} -e '${code}' "$STATUS" "$VERSION"`;
 }
 
 async function createProductionPlan(root: string, mode: 'success' | 'fail' | 'remove-backup' | 'sleep') {
@@ -101,6 +101,20 @@ test('update validation accepts only stable tags and strict path containment', (
   assert.equal(isPathWithin('/tmp/lucifold-update-1/source', '/tmp/lucifold-update-1'), true);
   assert.equal(isPathWithin('/tmp/lucifold-update-1/../outside', '/tmp/lucifold-update-1'), false);
   assert.equal(isPathWithin('/tmp/lucifold-update-1', '/tmp/lucifold-update-1'), false);
+});
+
+test('update verification resolves and validates one authenticated user-data path', async () => {
+  const root = await temporaryDirectory('lucifold-verification-path-');
+  const userDataPath = path.join(root, 'user-data');
+  const statusPath = path.join(userDataPath, 'update-status.json');
+  const currentAppPath = path.join(root, 'installed', 'lucifold.app');
+  const identity = 'a'.repeat(64);
+  await writeUpdateStatus(statusPath, { state: 'pending', version: '1.0.3', message: 'pending', timestamp: new Date().toISOString(), targetAppPath: currentAppPath, transactionId: '33333333-3333-4333-8333-333333333333', applicationIdentity: identity });
+  assert.equal(resolveVerificationUserDataPath(statusPath, '1.0.3', identity, currentAppPath), userDataPath);
+  assert.equal(resolveVerificationUserDataPath(statusPath, '1.0.3', identity, currentAppPath, userDataPath), userDataPath);
+  assert.equal(resolveVerificationUserDataPath(statusPath, '1.0.3', identity, currentAppPath, path.join(root, 'other-data')), null);
+  assert.equal(resolveVerificationUserDataPath(statusPath, '1.0.3', 'b'.repeat(64), currentAppPath), null);
+  await fs.rm(root, { recursive: true, force: true });
 });
 
 test('real local Git fixture rejects an unsigned lightweight tag after fetch', async () => {

@@ -1,9 +1,10 @@
 import { app, BrowserWindow, session } from 'electron';
+import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { registerIpc } from './ipc.js';
 import { isAllowedRendererUrl } from './ipc-security.js';
-import { isApprovedTag, markUpdateVerified } from './services/update-service.js';
+import { isApprovedTag, markUpdateVerified, resolveVerificationUserDataPath } from './services/update-service.js';
 import { recoverInterruptedUpdate, runUpdateHelper } from './services/update-helper.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -49,6 +50,21 @@ const helperPlanPath = argumentAfter('--lucifold-update-helper');
 const verificationStatusPath = argumentAfter('--lucifold-update-verify');
 const verificationVersion = verificationStatusPath ? process.argv[process.argv.indexOf('--lucifold-update-verify') + 2] : undefined;
 const verificationIdentity = verificationStatusPath ? process.argv[process.argv.indexOf('--lucifold-update-verify') + 3] : undefined;
+const requestedUserDataPath = argumentAfter('--user-data-dir');
+const currentAppPath = bundlePathFromExecutable(process.execPath);
+const verificationUserDataPath = verificationStatusPath && verificationVersion && verificationIdentity && currentAppPath
+  ? resolveVerificationUserDataPath(verificationStatusPath, verificationVersion, verificationIdentity, currentAppPath, requestedUserDataPath)
+  : null;
+
+if (verificationStatusPath && verificationVersion && verificationIdentity && !verificationUserDataPath) {
+  console.error('lucifold update verification arguments were rejected.');
+  app.exit(1);
+} else if (verificationUserDataPath) {
+  const sessionDataPath = path.join(verificationUserDataPath, 'session-data');
+  mkdirSync(sessionDataPath, { recursive: true, mode: 0o700 });
+  app.setPath('userData', verificationUserDataPath);
+  app.setPath('sessionData', sessionDataPath);
+}
 
 app.whenReady().then(async () => {
   if (helperPlanPath) {
@@ -63,10 +79,8 @@ app.whenReady().then(async () => {
   }
 
   if (verificationStatusPath && verificationVersion && verificationIdentity && isSafeVerificationArguments(verificationStatusPath, verificationVersion, verificationIdentity)) {
-    const currentAppPath = bundlePathFromExecutable(process.execPath);
     if (currentAppPath) pendingStartupVerification = { statusPath: verificationStatusPath, version: verificationVersion, identity: verificationIdentity, appPath: currentAppPath };
   } else if (app.isPackaged) {
-    const currentAppPath = bundlePathFromExecutable(process.execPath);
     if (currentAppPath) await recoverInterruptedUpdate(app.getPath('userData'), currentAppPath, app.getVersion()).catch((error) => console.warn('lucifold interrupted update recovery failed', error));
   }
 
