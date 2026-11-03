@@ -8,11 +8,17 @@ import { applicationIdentity, assertApplicationBundle, isApprovedTag, isPathWith
 const PARENT_EXIT_TIMEOUT = 60_000;
 const STARTUP_VERIFY_TIMEOUT = 45_000;
 
-export async function runUpdateHelper(planPath: string, options: { startupVerifyTimeout?: number } = {}): Promise<void> {
+export async function runUpdateHelper(planPath: string, options: { startupVerifyTimeout?: number; expectedUserDataPath?: string } = {}): Promise<void> {
   let plan: UpdatePlan | undefined;
+  const expectedAppPath = bundlePathFromExecutable(process.execPath);
   try {
     plan = await readPlan(planPath);
-    validatePlan(plan, bundlePathFromExecutable(process.execPath), true);
+    validatePlan(plan, expectedAppPath, true, options.expectedUserDataPath);
+    await Promise.all([plan.userDataPath, plan.stagingRoot, plan.stagedAppPath, plan.backupRoot, plan.backupPath, plan.targetAppPath, path.join(plan.userDataPath, 'update-backups')].map(assertNoUntrustedSymlink));
+    await assertCanonicalPathWithin(plan.userDataPath, options.expectedUserDataPath ?? plan.userDataPath, true);
+    await assertCanonicalPathWithin(plan.stagingRoot, os.tmpdir());
+    await assertCanonicalPathWithin(plan.stagedAppPath, plan.stagingRoot);
+    await assertCanonicalPathWithin(plan.backupRoot, path.join(plan.userDataPath, 'update-backups'));
     await assertLockOwnership(plan);
     await waitForParentExit(plan.parentPid, PARENT_EXIT_TIMEOUT);
     await fs.access(plan.lockPath);
@@ -30,13 +36,13 @@ export async function runUpdateHelper(planPath: string, options: { startupVerify
     await fs.rm(plan.backupRoot, { recursive: true, force: true }).catch(() => undefined);
     await fs.rm(plan.stagingRoot, { recursive: true, force: true }).catch(() => undefined);
   } catch (error) {
-    if (plan && isSafeStatusPath(plan)) {
+    if (plan && isSafeStatusPath(plan, expectedAppPath, options.expectedUserDataPath)) {
       await handleInstallationFailure(plan, error);
       await fs.rm(plan.stagingRoot, { recursive: true, force: true }).catch(() => undefined);
     }
     throw error;
   } finally {
-    if (plan && isSafeStatusPath(plan)) await releaseOwnedUpdateLock(plan);
+    if (plan && isSafeStatusPath(plan, expectedAppPath, options.expectedUserDataPath)) await releaseOwnedUpdateLock(plan);
   }
 }
 
@@ -75,6 +81,12 @@ export async function recoverInterruptedUpdate(userDataPath: string, currentAppP
     return;
   }
   try {
+    await Promise.all([plan.userDataPath, plan.backupRoot, plan.backupPath, plan.stagingRoot, plan.stagedAppPath, plan.targetAppPath, path.join(plan.userDataPath, 'update-backups')].map(assertNoUntrustedSymlink));
+    await assertCanonicalPathWithin(plan.userDataPath, userDataPath, true);
+    await assertCanonicalPathWithin(plan.backupRoot, path.join(plan.userDataPath, 'update-backups'));
+    await assertCanonicalPathWithin(plan.backupPath, plan.backupRoot);
+    await assertCanonicalPathWithin(plan.stagingRoot, os.tmpdir());
+    await assertCanonicalPathWithin(plan.stagedAppPath, plan.stagingRoot);
     validatePlan(plan, undefined, true);
   } catch (error) {
     await writeUpdateStatus(statusPath, { state: 'failed', version: status.version, message: `An interrupted update was found, but its recovery plan was invalid and no restoration was attempted. ${error instanceof Error ? error.message : ''}`.trim(), timestamp: new Date().toISOString() }).catch(() => undefined);
@@ -125,9 +137,10 @@ async function recoverStaleLockWithoutStatus(userDataPath: string): Promise<void
   }
 }
 
-function validatePlan(plan: UpdatePlan, expectedAppPath?: string, requireTransaction = false): void {
+function validatePlan(plan: UpdatePlan, expectedAppPath?: string, requireTransaction = false, expectedUserDataPath?: string): void {
   if (!plan || plan.version !== UPDATE_PLAN_VERSION || !Number.isInteger(plan.parentPid) || plan.parentPid <= 0 || !isApprovedTag(`v${plan.newVersion}`) || !plan.targetAppPath?.endsWith('.app') || !plan.stagedAppPath?.endsWith('.app') || !plan.stagingRoot || !plan.userDataPath || !plan.backupRoot || !plan.backupPath || !plan.lockPath || !plan.statusPath || !plan.targetExecutable || [plan.targetAppPath, plan.stagedAppPath, plan.stagingRoot, plan.userDataPath, plan.backupRoot, plan.backupPath, plan.lockPath, plan.statusPath, plan.targetExecutable].some((value) => !path.isAbsolute(value))) throw new Error('The update plan is invalid.');
   if (expectedAppPath && path.resolve(plan.targetAppPath) !== path.resolve(expectedAppPath)) throw new Error('The update plan does not target the running lucifold application.');
+  if (expectedUserDataPath && path.resolve(plan.userDataPath) !== path.resolve(expectedUserDataPath)) throw new Error('The update plan does not target the running lucifold user-data directory.');
   if (!path.basename(plan.stagingRoot).startsWith('lucifold-update-')) throw new Error('The staging directory is not an approved temporary update directory.');
   if (!isPathWithin(plan.stagingRoot, os.tmpdir())) throw new Error('The staging directory is outside the operating system temporary directory.');
   if (!isPathWithin(plan.stagedAppPath, plan.stagingRoot)) throw new Error('The staged application path is outside the staging directory.');
@@ -140,9 +153,9 @@ function validatePlan(plan: UpdatePlan, expectedAppPath?: string, requireTransac
   if (requireTransaction && (!plan.transactionId || !/^[0-9a-f-]{36}$/i.test(plan.transactionId) || !plan.expectedAppIdentity || !/^[0-9a-f]{64}$/i.test(plan.expectedAppIdentity) || !plan.knownGoodApplicationIdentity || !/^[0-9a-f]{64}$/i.test(plan.knownGoodApplicationIdentity))) throw new Error('The update plan is missing its transaction or application identity.');
 }
 
-function isSafeStatusPath(plan: UpdatePlan): boolean {
+function isSafeStatusPath(plan: UpdatePlan, expectedAppPath?: string, expectedUserDataPath?: string): boolean {
   try {
-    validatePlan(plan, undefined, true);
+    validatePlan(plan, expectedAppPath, true, expectedUserDataPath);
     return path.resolve(plan.statusPath) === path.resolve(path.join(plan.userDataPath, 'update-status.json')) && path.resolve(plan.lockPath) === path.resolve(path.join(plan.userDataPath, 'update.lock')) && path.basename(plan.stagingRoot).startsWith('lucifold-update-');
   } catch {
     return false;
@@ -151,6 +164,49 @@ function isSafeStatusPath(plan: UpdatePlan): boolean {
 
 async function readPlan(planPath: string): Promise<UpdatePlan> {
   return JSON.parse(await fs.readFile(planPath, 'utf8')) as UpdatePlan;
+}
+
+async function canonicalPathForExistingAncestor(candidate: string): Promise<string> {
+  const suffix: string[] = [];
+  let current = path.resolve(candidate);
+  while (true) {
+    try {
+      const canonical = await fs.realpath(current);
+      return path.join(canonical, ...suffix.reverse());
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      const parent = path.dirname(current);
+      if (parent === current) throw new Error('The update plan path has no existing filesystem ancestor.');
+      suffix.push(path.basename(current));
+      current = parent;
+    }
+  }
+}
+
+async function assertNoUntrustedSymlink(candidate: string): Promise<void> {
+  const resolved = path.resolve(candidate);
+  const parsed = path.parse(resolved);
+  let current = parsed.root;
+  for (const part of resolved.slice(parsed.root.length).split(path.sep).filter(Boolean)) {
+    current = path.join(current, part);
+    try {
+      const stat = await fs.lstat(current);
+      if (!stat.isSymbolicLink()) continue;
+      const target = await fs.realpath(current);
+      const systemAlias = (current === '/var' && target === '/private/var') || (current === '/tmp' && target === '/private/tmp');
+      if (!systemAlias) throw new Error('The update plan contains an untrusted symlinked path component.');
+    } catch (error) {
+      if (error instanceof Error && error.message.includes('untrusted symlinked')) throw error;
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+  }
+}
+
+async function assertCanonicalPathWithin(candidate: string, parent: string, allowEqual = false): Promise<void> {
+  const canonicalCandidate = await canonicalPathForExistingAncestor(candidate);
+  const canonicalParent = await canonicalPathForExistingAncestor(parent);
+  const relative = path.relative(canonicalParent, canonicalCandidate);
+  if ((!allowEqual && !relative) || relative.startsWith('..') || path.isAbsolute(relative)) throw new Error('The update plan contains a path outside its canonical boundary.');
 }
 
 async function waitForParentExit(parentPid: number, timeout: number): Promise<void> {

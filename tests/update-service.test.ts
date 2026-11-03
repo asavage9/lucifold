@@ -7,7 +7,7 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import test from 'node:test';
 import { performInstallationForTest, recoverInterruptedUpdate, runUpdateHelper } from '../src/main/services/update-helper.js';
-import { applicationIdentity, compareVersions, extractVerifiedArchiveForTest, isApprovedTag, isExpectedOrigin, isPathWithin, readUpdateStatus, resolveVerificationUserDataPath, validateArchiveEntries, writeUpdateStatus, UpdateService, type CommandRunner, type UpdatePlan } from '../src/main/services/update-service.js';
+import { applicationIdentity, compareVersions, extractVerifiedArchiveForTest, isApprovedTag, isExpectedOrigin, isPathWithin, markUpdateVerified, readUpdateStatus, resolveVerificationUserDataPath, validateArchiveEntries, writeUpdateStatus, UpdateService, type CommandRunner, type UpdatePlan } from '../src/main/services/update-service.js';
 
 const execFile = promisify(execFileCallback);
 
@@ -54,9 +54,9 @@ function verificationScript(mode: 'success' | 'fail' | 'remove-backup' | 'sleep'
   if (mode === 'fail') return 'exit 0';
   if (mode === 'sleep') return 'sleep 60';
   const code = mode === 'success'
-    ? 'const fs=require("fs");const p=process.argv[1];const s=JSON.parse(fs.readFileSync(p,"utf8"));s.state="verified";s.version=process.argv[2];fs.writeFileSync(p,JSON.stringify(s));'
+    ? 'const fs=require("fs");const path=require("path");const p=process.argv[1];const s=JSON.parse(fs.readFileSync(p,"utf8"));s.state="verified";s.version=process.argv[2];fs.writeFileSync(p,JSON.stringify(s));fs.writeFileSync(path.join(process.argv[3],"helper-user-data-marker"),"propagated");'
     : 'const fs=require("fs");const p=process.argv[1];const s=JSON.parse(fs.readFileSync(p,"utf8"));fs.rmSync(s.backupPath,{recursive:true,force:true});';
-  return `STATUS="$4"\nVERSION="$5"\n${process.execPath} -e '${code}' "$STATUS" "$VERSION"`;
+  return `USER_DATA="$2"\nSTATUS="$4"\nVERSION="$5"\n${process.execPath} -e '${code}' "$STATUS" "$VERSION" "$USER_DATA"`;
 }
 
 async function createProductionPlan(root: string, mode: 'success' | 'fail' | 'remove-backup' | 'sleep') {
@@ -79,7 +79,7 @@ async function createProductionPlan(root: string, mode: 'success' | 'fail' | 're
     backupPath: path.join(backupRoot, 'lucifold.app'),
     lockPath: path.join(userDataPath, 'update.lock'),
     statusPath: path.join(userDataPath, 'update-status.json'),
-    newVersion: '1.0.1',
+    newVersion: '1.0.3',
     targetExecutable: path.join(targetAppPath, 'Contents', 'MacOS', 'lucifold'),
     transactionId: '22222222-2222-4222-8222-222222222222',
     expectedAppIdentity: await applicationIdentity(stagedAppPath),
@@ -114,6 +114,37 @@ test('update verification resolves and validates one authenticated user-data pat
   assert.equal(resolveVerificationUserDataPath(statusPath, '1.0.3', identity, currentAppPath, userDataPath), userDataPath);
   assert.equal(resolveVerificationUserDataPath(statusPath, '1.0.3', identity, currentAppPath, path.join(root, 'other-data')), null);
   assert.equal(resolveVerificationUserDataPath(statusPath, '1.0.3', 'b'.repeat(64), currentAppPath), null);
+  for (const state of ['verified', 'installed', 'failed', 'rolled-back'] as const) {
+    await writeUpdateStatus(statusPath, { state, version: '1.0.3', message: state, timestamp: new Date().toISOString(), targetAppPath: currentAppPath, transactionId: '33333333-3333-4333-8333-333333333333', applicationIdentity: identity });
+    assert.equal(resolveVerificationUserDataPath(statusPath, '1.0.3', identity, currentAppPath), null);
+  }
+  await writeUpdateStatus(statusPath, { state: 'pending', version: '1.0.2', message: 'old', timestamp: new Date().toISOString(), targetAppPath: currentAppPath, transactionId: '33333333-3333-4333-8333-333333333333', applicationIdentity: identity });
+  assert.equal(resolveVerificationUserDataPath(statusPath, '1.0.3', identity, currentAppPath), null);
+  await writeUpdateStatus(statusPath, { state: 'pending', version: '1.0.3', message: 'wrong app', timestamp: new Date().toISOString(), targetAppPath: path.join(root, 'other.app'), transactionId: '33333333-3333-4333-8333-333333333333', applicationIdentity: identity });
+  assert.equal(resolveVerificationUserDataPath(statusPath, '1.0.3', identity, currentAppPath), null);
+
+  const aliasRoot = path.join(root, 'alias-root');
+  const canonicalRoot = path.join(root, 'canonical-root');
+  await fs.mkdir(path.join(canonicalRoot, 'user-data'), { recursive: true });
+  await fs.symlink(canonicalRoot, aliasRoot, 'dir');
+  const aliasedStatusPath = path.join(aliasRoot, 'user-data', 'update-status.json');
+  await writeUpdateStatus(path.join(canonicalRoot, 'user-data', 'update-status.json'), { state: 'pending', version: '1.0.3', message: 'aliased', timestamp: new Date().toISOString(), targetAppPath: currentAppPath, transactionId: '33333333-3333-4333-8333-333333333333', applicationIdentity: identity });
+  assert.equal(resolveVerificationUserDataPath(aliasedStatusPath, '1.0.3', identity, currentAppPath), null);
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test('startup verification accepts only the current application and version once', async () => {
+  const root = await temporaryDirectory('lucifold-verification-replay-');
+  const appPath = path.join(root, 'installed', 'lucifold.app');
+  const userDataPath = path.join(root, 'user-data');
+  const statusPath = path.join(userDataPath, 'update-status.json');
+  await createFixtureApp(appPath, 'exit 0', 'candidate');
+  const identity = await applicationIdentity(appPath);
+  await writeUpdateStatus(statusPath, { state: 'pending', version: '1.0.3', message: 'pending', timestamp: new Date().toISOString(), targetAppPath: appPath, transactionId: '44444444-4444-4444-8444-444444444444', applicationIdentity: identity });
+  assert.equal(await markUpdateVerified(statusPath, '1.0.3', '1.0.3', appPath, identity), true);
+  assert.equal((await readUpdateStatus(statusPath))?.state, 'verified');
+  assert.equal(await markUpdateVerified(statusPath, '1.0.3', '1.0.3', appPath, identity), false);
+  assert.equal(resolveVerificationUserDataPath(statusPath, '1.0.3', identity, appPath), null);
   await fs.rm(root, { recursive: true, force: true });
 });
 
@@ -680,11 +711,56 @@ test('production update helper installs only after startup verification and pres
   await runUpdateHelper(planPath, { startupVerifyTimeout: 2_000 });
 
   assert.equal(await fs.readFile(path.join(plan.targetAppPath, 'marker.txt'), 'utf8'), 'candidate');
+  assert.equal(await fs.readFile(path.join(plan.userDataPath, 'helper-user-data-marker'), 'utf8'), 'propagated');
   assert.equal((await readUpdateStatus(plan.statusPath))?.state, 'installed');
   await assert.rejects(fs.access(plan.lockPath));
   await assert.rejects(fs.access(plan.backupRoot));
   await assert.rejects(fs.access(plan.stagingRoot));
   for (const [filePath, contents] of preserved) assert.deepEqual(await fs.readFile(filePath), contents);
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test('production helper rejects a plan bound to an alternate user-data directory', async () => {
+  const root = await temporaryDirectory('lucifold-production-helper-user-data-boundary-');
+  const { plan, planPath } = await createProductionPlan(root, 'fail');
+  const alternateUserDataPath = path.join(root, 'alternate-data');
+  plan.userDataPath = alternateUserDataPath;
+  plan.lockPath = path.join(alternateUserDataPath, 'update.lock');
+  plan.statusPath = path.join(alternateUserDataPath, 'update-status.json');
+  plan.backupRoot = path.join(alternateUserDataPath, 'update-backups', 'integration');
+  plan.backupPath = path.join(plan.backupRoot, 'lucifold.app');
+  await fs.mkdir(alternateUserDataPath, { recursive: true });
+  await fs.writeFile(plan.lockPath, JSON.stringify({ pid: process.pid, transactionId: plan.transactionId }));
+  await fs.writeFile(planPath, JSON.stringify(plan));
+  await assert.rejects(runUpdateHelper(planPath, { expectedUserDataPath: path.join(root, 'data') }), /user-data directory/i);
+  assert.equal(await fs.readFile(path.join(plan.targetAppPath, 'marker.txt'), 'utf8'), 'known-good');
+  await assert.rejects(fs.access(plan.statusPath));
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test('production helper rejects a symlinked update-backups boundary before installation', async () => {
+  const root = await temporaryDirectory('lucifold-production-helper-backup-boundary-');
+  const { plan, planPath } = await createProductionPlan(root, 'fail');
+  const outside = path.join(root, 'outside-backups');
+  await fs.mkdir(outside, { recursive: true });
+  await fs.symlink(outside, path.join(plan.userDataPath, 'update-backups'), 'dir');
+  await fs.writeFile(planPath, JSON.stringify(plan));
+  await assert.rejects(runUpdateHelper(planPath, { expectedUserDataPath: plan.userDataPath }), /untrusted symlink|canonical boundary/i);
+  assert.equal(await fs.readFile(path.join(plan.targetAppPath, 'marker.txt'), 'utf8'), 'known-good');
+  assert.deepEqual(await fs.readdir(outside), []);
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test('production helper rejects a staging path that escapes through an ancestor symlink', async () => {
+  const root = await temporaryDirectory('lucifold-production-helper-staging-boundary-');
+  const { plan, planPath } = await createProductionPlan(root, 'fail');
+  const escapedStagingRoot = path.join(root, 'lucifold-update-escape');
+  await fs.symlink(path.resolve('.'), escapedStagingRoot, 'dir');
+  plan.stagingRoot = escapedStagingRoot;
+  plan.stagedAppPath = path.join(escapedStagingRoot, 'staged', 'lucifold.app');
+  await fs.writeFile(planPath, JSON.stringify(plan));
+  await assert.rejects(runUpdateHelper(planPath), /canonical boundary|untrusted symlink/i);
+  assert.equal(await fs.readFile(path.join(plan.targetAppPath, 'marker.txt'), 'utf8'), 'known-good');
   await fs.rm(root, { recursive: true, force: true });
 });
 

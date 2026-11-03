@@ -1,4 +1,4 @@
-import { constants as fsConstants, promises as fs, readFileSync, lstatSync } from 'node:fs';
+import { constants as fsConstants, promises as fs, readFileSync, lstatSync, realpathSync } from 'node:fs';
 import { execFile, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import os from 'node:os';
@@ -675,9 +675,10 @@ export async function applicationIdentity(appPath: string): Promise<string> {
 
 export async function markUpdateVerified(statusPath: string, expectedVersion: string, actualVersion: string, currentAppPath?: string, expectedIdentity?: string): Promise<boolean> {
   if (expectedVersion !== actualVersion) return false;
+  if (!currentAppPath || !expectedIdentity || !resolveVerificationUserDataPath(statusPath, expectedVersion, expectedIdentity, currentAppPath)) return false;
   const current = await readUpdateStatus(statusPath);
   if (!current || current.state !== 'pending' || current.version !== expectedVersion) return false;
-  if (!currentAppPath || !current.targetAppPath || path.resolve(current.targetAppPath) !== path.resolve(currentAppPath) || !expectedIdentity || expectedIdentity !== current.applicationIdentity) return false;
+  if (!current.targetAppPath || path.resolve(current.targetAppPath) !== path.resolve(currentAppPath) || expectedIdentity !== current.applicationIdentity) return false;
   if (expectedIdentity !== await applicationIdentity(currentAppPath)) return false;
   await writeUpdateStatus(statusPath, { state: 'verified', version: expectedVersion, message: `lucifold ${expectedVersion} started successfully after update.`, timestamp: new Date().toISOString(), backupPath: current.backupPath, lockPath: current.lockPath, stagingRoot: current.stagingRoot, targetAppPath: current.targetAppPath, transactionId: current.transactionId, applicationIdentity: current.applicationIdentity, knownGoodApplicationIdentity: current.knownGoodApplicationIdentity });
   return true;
@@ -690,6 +691,7 @@ export function resolveVerificationUserDataPath(statusPath: string, expectedVers
     const statusStat = lstatSync(statusPath);
     const userDataStat = lstatSync(path.dirname(statusPath));
     if (!statusStat.isFile() || statusStat.isSymbolicLink() || !userDataStat.isDirectory() || userDataStat.isSymbolicLink()) return null;
+    if (hasUntrustedSymlink(statusPath) || hasUntrustedSymlink(path.dirname(statusPath))) return null;
     status = JSON.parse(readFileSync(statusPath, 'utf8')) as UpdateStatusRecord;
   } catch {
     return null;
@@ -757,6 +759,25 @@ function isValidReleaseSigningKey(value: string): boolean {
 
 function isValidReleaseSigningPrincipal(value: string): boolean {
   return /^[A-Za-z0-9._@+-]+$/.test(value);
+}
+
+function hasUntrustedSymlink(candidate: string): boolean {
+  const resolved = path.resolve(candidate);
+  const parsed = path.parse(resolved);
+  let current = parsed.root;
+  for (const part of resolved.slice(parsed.root.length).split(path.sep).filter(Boolean)) {
+    current = path.join(current, part);
+    try {
+      const stat = lstatSync(current);
+      if (!stat.isSymbolicLink()) continue;
+      const target = realpathSync.native(current);
+      const systemAlias = (current === '/var' && target === '/private/var') || (current === '/tmp' && target === '/private/tmp');
+      if (!systemAlias) return true;
+    } catch {
+      return true;
+    }
+  }
+  return false;
 }
 
 function commandFailureMessage(error: unknown, fallback: string): string {

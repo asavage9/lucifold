@@ -69,7 +69,7 @@ if (verificationStatusPath && verificationVersion && verificationIdentity && !ve
 app.whenReady().then(async () => {
   if (helperPlanPath) {
     try {
-      await runUpdateHelper(helperPlanPath);
+      await runUpdateHelper(helperPlanPath, { expectedUserDataPath: app.getPath('userData') });
       app.quit();
     } catch (error) {
       console.error('lucifold update helper failed', error);
