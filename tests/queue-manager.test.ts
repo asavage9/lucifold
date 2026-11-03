@@ -302,7 +302,7 @@ test('concurrent directory mutation cannot redirect publication to an external s
       assert.ok(actualPublishedPath);
       const relativePublishedPath = path.relative(destinationRealPath, await fs.realpath(actualPublishedPath));
       assert.ok(relativePublishedPath && !relativePublishedPath.startsWith(`..${path.sep}`) && !path.isAbsolute(relativePublishedPath));
-      assert.equal(await fs.readFile(actualPublishedPath), await fs.readFile(source));
+      assert.deepEqual(await fs.readFile(actualPublishedPath), await fs.readFile(source));
     } else {
       assert.ok(report.failures.length > 0);
     }

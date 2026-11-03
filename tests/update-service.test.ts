@@ -680,20 +680,36 @@ test('forced helper termination leaves a recoverable pending transaction and sta
   await fs.writeFile(planPath, JSON.stringify(plan));
   const code = 'import { runUpdateHelper } from "./src/main/services/update-helper.ts"; await runUpdateHelper(process.argv.at(-1));';
   const child = spawn(process.execPath, ['--import', 'tsx/esm', '--input-type=module', '-e', code, planPath], { cwd: path.resolve('.'), stdio: 'ignore' });
-  let pending = false;
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    const status = await readUpdateStatus(plan.statusPath);
-    if (status?.state === 'pending') { pending = true; break; }
-    await new Promise((resolve) => setTimeout(resolve, 20));
+  const childExit = once(child, 'exit');
+  let childExited = false;
+  try {
+    let recoverable = false;
+    for (let attempt = 0; attempt < 150; attempt += 1) {
+      const status = await readUpdateStatus(plan.statusPath);
+      const backupIdentity = await applicationIdentity(plan.backupPath).catch(() => undefined);
+      const targetIdentity = await applicationIdentity(plan.targetAppPath).catch(() => undefined);
+      if (status?.state === 'pending' && backupIdentity === plan.knownGoodApplicationIdentity && targetIdentity === plan.expectedAppIdentity) {
+        recoverable = true;
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(recoverable, true);
+    child.kill('SIGKILL');
+    await childExit;
+    childExited = true;
+    await recoverInterruptedUpdate(plan.userDataPath, plan.targetAppPath, '1.0.0');
+    assert.equal(await fs.readFile(path.join(plan.targetAppPath, 'marker.txt'), 'utf8'), 'known-good');
+    assert.equal((await readUpdateStatus(plan.statusPath))?.state, 'rolled-back');
+    assert.equal(await applicationIdentity(plan.targetAppPath), plan.knownGoodApplicationIdentity);
+    await assert.rejects(fs.access(plan.lockPath));
+  } finally {
+    if (!childExited) {
+      child.kill('SIGKILL');
+      await childExit;
+    }
+    await fs.rm(root, { recursive: true, force: true });
   }
-  assert.equal(pending, true);
-  child.kill('SIGKILL');
-  await once(child, 'exit');
-  await recoverInterruptedUpdate(plan.userDataPath, plan.targetAppPath, '1.0.0');
-  assert.equal(await fs.readFile(path.join(plan.targetAppPath, 'marker.txt'), 'utf8'), 'known-good');
-  assert.equal((await readUpdateStatus(plan.statusPath))?.state, 'rolled-back');
-  await assert.rejects(fs.access(plan.lockPath));
-  await fs.rm(root, { recursive: true, force: true });
 });
 
 test('production helper rolls back after failed relaunch and reports failed rollback without a known-good copy', async () => {
