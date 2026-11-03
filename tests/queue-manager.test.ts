@@ -285,19 +285,34 @@ test('concurrent directory mutation cannot redirect publication to an external s
       }
     }
   })();
-  let report;
+  let report: Awaited<ReturnType<QueueManager['exportResults']>> | undefined;
   try {
     report = await queue.exportResults({ itemIds: [item.id], destination, preserveHierarchy: true, expectedSettingsHashByItem: { [item.id]: settingsSignature(DEFAULT_SETTINGS) } });
+    finished = true;
+    await mutator;
+
+    assert.equal(await fs.readFile(sentinel, 'utf8'), 'unchanged');
+    await assert.rejects(fs.access(path.join(outside, 'source.jpg')));
+    if (report.exported.length > 0) {
+      const publishedPath = report.exported[0].path;
+      const destinationRealPath = await fs.realpath(destination);
+      const possiblePublishedPaths = [publishedPath, path.join(hierarchy, 'source.jpg'), path.join(movedHierarchy, 'source.jpg')];
+      const existingPaths = await Promise.all(possiblePublishedPaths.map(async (candidate) => await fs.access(candidate).then(() => candidate).catch(() => null)));
+      const actualPublishedPath = existingPaths.find((candidate): candidate is string => candidate !== null);
+      assert.ok(actualPublishedPath);
+      const relativePublishedPath = path.relative(destinationRealPath, await fs.realpath(actualPublishedPath));
+      assert.ok(relativePublishedPath && !relativePublishedPath.startsWith(`..${path.sep}`) && !path.isAbsolute(relativePublishedPath));
+      assert.equal(await fs.readFile(actualPublishedPath), await fs.readFile(source));
+    } else {
+      assert.ok(report.failures.length > 0);
+    }
   } finally {
     finished = true;
     await mutator;
     await fs.rm(hierarchy, { recursive: true, force: true }).catch(() => undefined);
     await fs.rename(movedHierarchy, hierarchy).catch(() => undefined);
+    await fs.rm(root, { recursive: true, force: true });
   }
-  assert.equal(await fs.readFile(sentinel, 'utf8'), 'unchanged');
-  await assert.rejects(fs.access(path.join(outside, 'source.jpg')));
-  if (report.exported.length > 0) assert.equal(await fs.readFile(path.join(hierarchy, 'source.jpg')), await fs.readFile(source));
-  await fs.rm(root, { recursive: true, force: true });
 });
 
 test('failed native publication reports accurately and leaves no temporary export files', async (t) => {
