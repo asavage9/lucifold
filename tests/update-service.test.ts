@@ -7,7 +7,8 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import test from 'node:test';
 import { performInstallationForTest, recoverInterruptedUpdate, runUpdateHelper } from '../src/main/services/update-helper.js';
-import { applicationIdentity, compareVersions, extractVerifiedArchiveForTest, isApprovedTag, isExpectedOrigin, isPathWithin, markUpdateVerified, prepareVerificationSessionDataPath, readUpdateStatus, resolveVerificationUserDataPath, validateArchiveEntries, writeUpdateStatus, UpdateService, type CommandRunner, type UpdatePlan } from '../src/main/services/update-service.js';
+import { applicationIdentity, compareVersions, extractVerifiedArchiveForTest, isApprovedTag, isExpectedOrigin, isPathWithin, markUpdateVerified, readUpdateStatus, resolveVerificationUserDataPath, validateArchiveEntries, writeUpdateStatus, UpdateService, type CommandRunner, type UpdatePlan } from '../src/main/services/update-service.js';
+import { resolveCanonicalApplicationDataPath } from '../src/main/services/application-paths.js';
 import { parseUpdaterArguments } from '../src/main/services/verification-arguments.js';
 
 const execFile = promisify(execFileCallback);
@@ -138,6 +139,7 @@ test('update verification resolves and validates one authenticated user-data pat
   await writeUpdateStatus(statusPath, { state: 'pending', version: '1.0.3', message: 'pending', timestamp: new Date().toISOString(), targetAppPath: currentAppPath, transactionId, transactionAuthorization, lockPath, applicationIdentity: identity });
   assert.equal(resolveVerificationUserDataPath(statusPath, '1.0.3', identity, currentAppPath), null);
   assert.equal(resolveVerificationUserDataPath(statusPath, '1.0.3', identity, currentAppPath, userDataPath, userDataPath), userDataPath);
+  await assert.rejects(fs.access(path.join(userDataPath, 'session-data')));
   assert.equal(resolveVerificationUserDataPath(statusPath, '1.0.3', identity, currentAppPath, userDataPath, path.join(root, 'redirected-data')), null);
   assert.equal(resolveVerificationUserDataPath(statusPath, '1.0.3', identity, currentAppPath, path.join(root, 'other-data'), userDataPath), null);
   assert.equal(resolveVerificationUserDataPath(statusPath, '1.0.3', 'b'.repeat(64), currentAppPath, undefined, userDataPath), null);
@@ -199,31 +201,9 @@ test('startup verification accepts only the current application and version once
   await fs.rm(root, { recursive: true, force: true });
 });
 
-test('verification session storage rejects symlinks, external populations, hard links, and replacement', async () => {
-  const root = await temporaryDirectory('lucifold-session-data-');
-  const canonical = path.join(root, 'user-data');
-  await fs.mkdir(canonical, { recursive: true, mode: 0o700 });
-  const session = prepareVerificationSessionDataPath(canonical);
-  assert.equal(session, path.join(canonical, 'session-data'));
-  const external = path.join(root, 'external-session');
-  await fs.mkdir(external, { mode: 0o700 });
-  await fs.writeFile(path.join(external, 'sentinel'), 'must-remain');
-  await fs.rm(session, { recursive: true, force: true });
-  await fs.symlink(external, session, 'dir');
-  assert.equal(prepareVerificationSessionDataPath(canonical), null);
-  assert.equal(await fs.readFile(path.join(external, 'sentinel'), 'utf8'), 'must-remain');
-  await fs.rm(session);
-  const hardLinkSource = path.join(root, 'session-file');
-  await fs.writeFile(hardLinkSource, 'not-a-directory');
-  await fs.link(hardLinkSource, session);
-  assert.equal(prepareVerificationSessionDataPath(canonical), null);
-  await fs.rm(session);
-  await fs.mkdir(session, { mode: 0o700 });
-  assert.equal(prepareVerificationSessionDataPath(canonical), session);
-  await fs.rm(session, { recursive: true });
-  await fs.symlink(external, session, 'dir');
-  assert.equal(prepareVerificationSessionDataPath(canonical), null);
-  await fs.rm(root, { recursive: true, force: true });
+test('macOS canonical application data ignores a temporary helper HOME', () => {
+  assert.equal(resolveCanonicalApplicationDataPath('/tmp/temporary-home/Library/Application Support', 'lucifold', 'darwin', '/Users/tester'), '/Users/tester/Library/Application Support/lucifold');
+  assert.throws(() => resolveCanonicalApplicationDataPath('/tmp/app-data', 'lucifold', 'darwin', 'relative-home'), /account home/i);
 });
 
 test('real local Git fixture rejects an unsigned lightweight tag after fetch', async () => {

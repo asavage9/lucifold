@@ -1,14 +1,15 @@
 import { app, BrowserWindow, session } from 'electron';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { registerIpc } from './ipc.js';
 import { isAllowedRendererUrl } from './ipc-security.js';
-import { isApprovedTag, markUpdateVerified, prepareVerificationSessionDataPath, resolveVerificationUserDataPath } from './services/update-service.js';
+import { isApprovedTag, markUpdateVerified, resolveVerificationUserDataPath } from './services/update-service.js';
 import { recoverInterruptedUpdate, runUpdateHelper } from './services/update-helper.js';
 import { parseUpdaterArguments } from './services/verification-arguments.js';
+import { resolveCanonicalApplicationDataPath } from './services/application-paths.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-let pendingStartupVerification: { statusPath: string; version: string; identity: string; appPath: string; canonicalUserDataPath: string } | null = null;
 
 function createWindow(): BrowserWindow {
   const window = new BrowserWindow({
@@ -36,11 +37,6 @@ function createWindow(): BrowserWindow {
   else void window.loadFile(path.join(__dirname, '../../renderer/index.html'));
   window.once('ready-to-show', () => {
     window.show();
-    const verification = pendingStartupVerification;
-    if (verification) {
-      pendingStartupVerification = null;
-      void markUpdateVerified(verification.statusPath, verification.version, app.getVersion(), verification.appPath, verification.identity, verification.canonicalUserDataPath).catch((error) => console.warn('lucifold update verification could not be recorded', error));
-    }
   });
   registerIpc(window);
   return window;
@@ -52,8 +48,11 @@ const verificationStatusPath = parsedUpdaterArguments.kind === 'verification' ? 
 const verificationVersion = parsedUpdaterArguments.kind === 'verification' ? parsedUpdaterArguments.version : undefined;
 const verificationIdentity = parsedUpdaterArguments.kind === 'verification' ? parsedUpdaterArguments.identity : undefined;
 const requestedUserDataPath = parsedUpdaterArguments.kind === 'verification' ? parsedUpdaterArguments.userDataPath : undefined;
-const canonicalApplicationDataPath = path.join(app.getPath('appData'), app.getName());
+const canonicalApplicationDataPath = resolveCanonicalApplicationDataPath(app.getPath('appData'), app.getName(), process.platform, process.platform === 'darwin' ? os.userInfo().homedir : undefined);
 app.setPath('userData', canonicalApplicationDataPath);
+// Electron's default sessionData path follows userData. Set it explicitly so
+// no helper argument or temporary HOME can redirect persistent session state.
+app.setPath('sessionData', canonicalApplicationDataPath);
 const currentAppPath = bundlePathFromExecutable(process.execPath);
 const verificationUserDataPath = verificationStatusPath && verificationVersion && verificationIdentity && currentAppPath
   ? resolveVerificationUserDataPath(verificationStatusPath, verificationVersion, verificationIdentity, currentAppPath, requestedUserDataPath, canonicalApplicationDataPath)
@@ -62,16 +61,6 @@ const verificationUserDataPath = verificationStatusPath && verificationVersion &
 if (parsedUpdaterArguments.kind === 'invalid' || (verificationStatusPath && verificationVersion && verificationIdentity && !verificationUserDataPath)) {
   console.error('lucifold update verification arguments were rejected.');
   app.exit(1);
-} else if (verificationUserDataPath) {
-  const sessionDataPath = prepareVerificationSessionDataPath(verificationUserDataPath);
-  if (!sessionDataPath) {
-    console.error('lucifold update verification session storage was rejected.');
-    app.exit(1);
-  }
-  if (sessionDataPath) {
-    app.setPath('userData', verificationUserDataPath);
-    app.setPath('sessionData', sessionDataPath);
-  }
 }
 
 app.whenReady().then(async () => {
@@ -86,8 +75,13 @@ app.whenReady().then(async () => {
     return;
   }
 
-  if (verificationStatusPath && verificationVersion && verificationIdentity && isSafeVerificationArguments(verificationStatusPath, verificationVersion, verificationIdentity)) {
-    if (currentAppPath) pendingStartupVerification = { statusPath: verificationStatusPath, version: verificationVersion, identity: verificationIdentity, appPath: currentAppPath, canonicalUserDataPath: canonicalApplicationDataPath };
+  if (verificationStatusPath && verificationVersion && verificationIdentity) {
+    const verified = Boolean(currentAppPath && isSafeVerificationArguments(verificationStatusPath, verificationVersion, verificationIdentity) && await markUpdateVerified(verificationStatusPath, verificationVersion, app.getVersion(), currentAppPath, verificationIdentity, canonicalApplicationDataPath).catch(() => false));
+    if (!verified) {
+      console.error('lucifold update startup verification failed.');
+      app.exit(1);
+      return;
+    }
   } else if (app.isPackaged) {
     if (currentAppPath) await recoverInterruptedUpdate(app.getPath('userData'), currentAppPath, app.getVersion()).catch((error) => console.warn('lucifold interrupted update recovery failed', error));
   }

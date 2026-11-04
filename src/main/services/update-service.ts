@@ -1,20 +1,15 @@
-import { constants as fsConstants, closeSync, fstatSync, ftruncateSync, fsyncSync, mkdirSync, openSync, promises as fs, readFileSync, lstatSync, realpathSync, writeSync } from 'node:fs';
+import { constants as fsConstants, closeSync, fstatSync, ftruncateSync, fsyncSync, openSync, promises as fs, readFileSync, lstatSync, realpathSync, writeSync } from 'node:fs';
 import { execFile, spawn } from 'node:child_process';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import type { UpdateCheckResult, UpdateProgress, UpdateStatusRecord } from '../../shared/types.js';
 
-/**
- * Deliberately unset until Anthony establishes the real lucifold repository.
- * A future approved build must replace this with the exact HTTPS/SSH origin;
- * the updater must never infer a production source from shotset or a UI path.
- */
+/** The only repository origin accepted by the signed updater. */
 export const APPROVED_LUCIFOLD_ORIGIN = 'https://github.com/asavage9/lucifold.git';
 /**
- * A future updater-enabled release must replace this with Anthony's
- * independently verified SSH release-signing public key. Keeping it unset in
- * the everyday build makes signed-release verification fail closed.
+ * Anthony's independently verified SSH release-signing public key. This key
+ * is trusted independently of downloaded repository contents.
  */
 export const APPROVED_LUCIFOLD_RELEASE_SIGNING_KEY = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGlkdfd6tPwtF57kqCzbkq+49Ryz3zwJIeQ5OMPEZMlf lucifold-release';
 export const APPROVED_LUCIFOLD_RELEASE_SIGNING_PRINCIPAL = 'lucifold-release';
@@ -740,29 +735,6 @@ function openAuthenticatedVerificationState(statusPath: string, expectedVersion:
       if (statusFd !== undefined) closeSync(statusFd);
       if (lockFd !== undefined) closeSync(lockFd);
     }
-  }
-}
-
-export function prepareVerificationSessionDataPath(canonicalUserDataPath: string): string | null {
-  if (!path.isAbsolute(canonicalUserDataPath) || hasUntrustedSymlink(canonicalUserDataPath)) return null;
-  const root = path.resolve(canonicalUserDataPath);
-  const sessionDataPath = path.join(root, 'session-data');
-  if (!isPathWithin(sessionDataPath, root)) return null;
-  try {
-    const rootStat = lstatSync(root);
-    if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) return null;
-    try {
-      const sessionStat = lstatSync(sessionDataPath);
-      if (!sessionStat.isDirectory() || sessionStat.isSymbolicLink() || (sessionStat.mode & 0o077) !== 0 || hasUntrustedSymlink(sessionDataPath)) return null;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return null;
-      mkdirSync(sessionDataPath, { mode: 0o700 });
-      const createdStat = lstatSync(sessionDataPath);
-      if (!createdStat.isDirectory() || createdStat.isSymbolicLink() || (createdStat.mode & 0o077) !== 0 || hasUntrustedSymlink(sessionDataPath)) return null;
-    }
-    return sessionDataPath;
-  } catch {
-    return null;
   }
 }
 
