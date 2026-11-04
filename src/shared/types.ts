@@ -160,6 +160,7 @@ export interface UpdateStatusRecord {
   stagingRoot?: string;
   targetAppPath?: string;
   transactionId?: string;
+  transactionAuthorization?: string;
   applicationIdentity?: string;
   knownGoodApplicationIdentity?: string;
 }

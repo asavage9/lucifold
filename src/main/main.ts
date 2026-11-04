@@ -1,10 +1,9 @@
 import { app, BrowserWindow, session } from 'electron';
-import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { registerIpc } from './ipc.js';
 import { isAllowedRendererUrl } from './ipc-security.js';
-import { isApprovedTag, markUpdateVerified, resolveVerificationUserDataPath } from './services/update-service.js';
+import { isApprovedTag, markUpdateVerified, prepareVerificationSessionDataPath, resolveVerificationUserDataPath } from './services/update-service.js';
 import { recoverInterruptedUpdate, runUpdateHelper } from './services/update-helper.js';
 import { parseUpdaterArguments } from './services/verification-arguments.js';
 
@@ -64,10 +63,15 @@ if (parsedUpdaterArguments.kind === 'invalid' || (verificationStatusPath && veri
   console.error('lucifold update verification arguments were rejected.');
   app.exit(1);
 } else if (verificationUserDataPath) {
-  const sessionDataPath = path.join(verificationUserDataPath, 'session-data');
-  mkdirSync(sessionDataPath, { recursive: true, mode: 0o700 });
-  app.setPath('userData', verificationUserDataPath);
-  app.setPath('sessionData', sessionDataPath);
+  const sessionDataPath = prepareVerificationSessionDataPath(verificationUserDataPath);
+  if (!sessionDataPath) {
+    console.error('lucifold update verification session storage was rejected.');
+    app.exit(1);
+  }
+  if (sessionDataPath) {
+    app.setPath('userData', verificationUserDataPath);
+    app.setPath('sessionData', sessionDataPath);
+  }
 }
 
 app.whenReady().then(async () => {

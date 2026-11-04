@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNod
 import type { AppInfo, AppSettings, AppView, BatchState, ImageFormat, OptimizationRequest, OptimizationSettings, Preset, QueueItem, QueueUpdate, SupportedFormat, UpdateCheckResult, UpdateProgress } from '../shared/types';
 import { DEFAULT_APP_SETTINGS, DEFAULT_SETTINGS } from '../shared/types';
 import { resolveSettings, settingsSignature } from '../shared/settings';
+import { resolveDroppedFilePaths } from './drop-paths';
 
 type AppMessage = { tone: 'info' | 'error' | 'success'; text: string; actionPath?: string };
 
@@ -241,15 +242,18 @@ export default function App() {
     if (selectedId && !items.some((item) => item.id === selectedId)) setSelectedId(items[0]?.id ?? null);
   }, [items, selectedId]);
 
-  const importSelectedPaths = async (paths: string[]) => {
-    if (!paths.length) return;
+  const importSelectedPaths = async (paths: string[], options: { unresolved?: number; fromDrop?: boolean } = {}) => {
+    if (!paths.length) {
+      if (options.fromDrop) setMessage({ tone: 'error', text: options.unresolved ? 'The dropped items could not be resolved to local files.' : 'No files or folders were found in the drop.' });
+      return;
+    }
     try {
       const response = await window.lucifold.importPaths(paths);
       setItems(response.items);
       const importedOverrides = Object.fromEntries(response.items.flatMap((item) => item.settingsOverride ? [[item.id, item.settingsOverride]] : [])) as Record<string, Partial<OptimizationSettings>>;
       setOverrides((current) => ({ ...current, ...importedOverrides }));
       if (!selectedId && response.items[0]) setSelectedId(response.items[0].id);
-      if (response.issues.length) setMessage({ tone: 'error', text: `${response.items.length} imported · ${response.issues.length} skipped or failed. ${response.issues[0].message}` });
+      if (response.issues.length || options.unresolved) setMessage({ tone: 'error', text: `${response.items.length} imported · ${response.issues.length + (options.unresolved ?? 0)} skipped or failed. ${response.issues[0]?.message ?? 'Some dropped items could not be resolved to local files.'}` });
       else setMessage({ tone: 'success', text: `${response.items.length} image${response.items.length === 1 ? '' : 's'} ready.` });
     } catch (error) {
       setMessage({ tone: 'error', text: error instanceof Error ? error.message : 'Import failed.' });
@@ -380,8 +384,8 @@ export default function App() {
     event.preventDefault();
     dragDepth.current = 0;
     setIsDraggingFiles(false);
-    const paths = [...event.dataTransfer.files].map((file) => (file as File & { path?: string }).path).filter((filePath): filePath is string => Boolean(filePath));
-    void importSelectedPaths(paths);
+    const resolved = resolveDroppedFilePaths([...event.dataTransfer.files], window.lucifold.getPathForDroppedFile);
+    void importSelectedPaths(resolved.paths, { unresolved: resolved.unresolved, fromDrop: true });
   };
 
   const appStyle = { '--queue-width': 'minmax(350px, 430px)' } as CSSProperties;

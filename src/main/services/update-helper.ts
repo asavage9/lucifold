@@ -11,6 +11,7 @@ const STARTUP_VERIFY_TIMEOUT = 45_000;
 export async function runUpdateHelper(planPath: string, options: { startupVerifyTimeout?: number; expectedUserDataPath?: string } = {}): Promise<void> {
   let plan: UpdatePlan | undefined;
   let authorized = false;
+  let installationStarted = false;
   let backupRootOwned = false;
   let backupMoved = false;
   const expectedAppPath = bundlePathFromExecutable(process.execPath);
@@ -23,7 +24,6 @@ export async function runUpdateHelper(planPath: string, options: { startupVerify
     await assertCanonicalPathWithin(plan.stagedAppPath, plan.stagingRoot);
     await assertCanonicalPathWithin(plan.backupRoot, path.join(plan.userDataPath, 'update-backups'));
     await assertLockOwnership(plan);
-    authorized = true;
     await waitForParentExit(plan.parentPid, PARENT_EXIT_TIMEOUT);
     await fs.access(plan.lockPath);
     await assertKnownGoodApplication(plan);
@@ -31,10 +31,12 @@ export async function runUpdateHelper(planPath: string, options: { startupVerify
     await fs.mkdir(plan.backupRoot, { mode: 0o700 });
     backupRootOwned = true;
     const ownershipMarker = plan.backupOwnershipMarker ?? path.join(plan.backupRoot, '.lucifold-owner');
-    await fs.writeFile(ownershipMarker, `${plan.transactionId}\n`, { flag: 'wx', mode: 0o600 });
+    await fs.writeFile(ownershipMarker, `${plan.transactionAuthorization}\n`, { flag: 'wx', mode: 0o600 });
+    authorized = true;
     await syncDirectory(path.dirname(plan.backupRoot));
     await fs.access(path.dirname(plan.targetAppPath), fsConstants.W_OK);
     await writePendingStatus(plan);
+    installationStarted = true;
     await movePath(plan.targetAppPath, plan.backupPath);
     backupMoved = true;
     await movePath(plan.stagedAppPath, plan.targetAppPath);
@@ -45,13 +47,13 @@ export async function runUpdateHelper(planPath: string, options: { startupVerify
     if (backupRootOwned) await fs.rm(plan.backupRoot, { recursive: true, force: true }).catch(() => undefined);
     await fs.rm(plan.stagingRoot, { recursive: true, force: true }).catch(() => undefined);
   } catch (error) {
-    if (plan && authorized && isSafeStatusPath(plan, expectedAppPath, options.expectedUserDataPath)) {
+    if (plan && installationStarted && authorized && isSafeStatusPath(plan, expectedAppPath, options.expectedUserDataPath)) {
       await handleInstallationFailure(plan, error, undefined, backupMoved);
       if (backupRootOwned) await fs.rm(plan.stagingRoot, { recursive: true, force: true }).catch(() => undefined);
     }
     throw error;
   } finally {
-    if (plan && authorized && isSafeStatusPath(plan, expectedAppPath, options.expectedUserDataPath)) await releaseOwnedUpdateLock(plan);
+    if (plan && installationStarted && authorized && isSafeStatusPath(plan, expectedAppPath, options.expectedUserDataPath)) await releaseOwnedUpdateLock(plan);
   }
 }
 
@@ -80,15 +82,9 @@ export async function recoverInterruptedUpdate(userDataPath: string, currentAppP
     return;
   }
   if (!['pending', 'verified'].includes(status.state)) return;
-  if (!status.targetAppPath || path.resolve(status.targetAppPath) !== path.resolve(currentAppPath) || !status.backupPath || !status.stagingRoot || !status.lockPath || !status.transactionId) {
-    await writeUpdateStatus(statusPath, { state: 'failed', version: status.version, message: 'An interrupted update was found, but its recovery state was incomplete and was not trusted.', timestamp: new Date().toISOString() }).catch(() => undefined);
-    return;
-  }
+  if (!status.targetAppPath || path.resolve(status.targetAppPath) !== path.resolve(currentAppPath) || !status.backupPath || !status.stagingRoot || !status.lockPath || !status.transactionId) return;
   const plan = recoveryPlan(status, userDataPath, currentAppPath);
-  if (!plan) {
-    await writeUpdateStatus(statusPath, { state: 'failed', version: status.version, message: 'An interrupted update was found, but its recovery paths were outside the approved application and data boundaries.', timestamp: new Date().toISOString() }).catch(() => undefined);
-    return;
-  }
+  if (!plan) return;
   try {
     await Promise.all([plan.userDataPath, plan.backupRoot, plan.backupPath, plan.stagingRoot, plan.stagedAppPath, plan.targetAppPath, path.join(plan.userDataPath, 'update-backups')].map(assertNoUntrustedSymlink));
     await assertCanonicalPathWithin(plan.userDataPath, userDataPath, true);
@@ -97,17 +93,11 @@ export async function recoverInterruptedUpdate(userDataPath: string, currentAppP
     await assertCanonicalPathWithin(plan.stagingRoot, os.tmpdir());
     await assertCanonicalPathWithin(plan.stagedAppPath, plan.stagingRoot);
     validatePlan(plan, undefined, true);
-  } catch (error) {
-    await writeUpdateStatus(statusPath, { state: 'failed', version: status.version, message: `An interrupted update was found, but its recovery plan was invalid and no restoration was attempted. ${error instanceof Error ? error.message : ''}`.trim(), timestamp: new Date().toISOString() }).catch(() => undefined);
-    return;
-  }
+  } catch { return; }
   try {
     await assertLockOwnership(plan);
     await assertBackupOwnership(plan);
-  } catch (error) {
-    await writeUpdateStatus(statusPath, { state: 'failed', version: status.version, message: `An interrupted update was found, but its transaction lock could not be verified. ${error instanceof Error ? error.message : ''}`.trim(), timestamp: new Date().toISOString(), backupPath: plan.backupPath, lockPath: plan.lockPath, stagingRoot: plan.stagingRoot, targetAppPath: plan.targetAppPath, transactionId: plan.transactionId, applicationIdentity: plan.expectedAppIdentity }).catch(() => undefined);
-    return;
-  }
+  } catch { return; }
   const verifiedBundleMatches = status.state === 'verified' && status.version === currentVersion && Boolean(status.applicationIdentity) && await applicationIdentity(currentAppPath).then((identity) => identity === status.applicationIdentity).catch(() => false);
   if (verifiedBundleMatches) {
     await writeUpdateStatus(statusPath, { ...status, state: 'installed', message: `lucifold ${currentVersion} completed recovery after startup verification.`, timestamp: new Date().toISOString() });
@@ -160,7 +150,7 @@ function validatePlan(plan: UpdatePlan, expectedAppPath?: string, requireTransac
   if (path.resolve(plan.statusPath) !== path.resolve(path.join(plan.userDataPath, 'update-status.json'))) throw new Error('The update status path is not inside lucifold data.');
   if (path.resolve(plan.targetExecutable) !== path.resolve(path.join(plan.targetAppPath, 'Contents', 'MacOS', 'lucifold'))) throw new Error('The update executable path is invalid.');
   if (path.resolve(plan.targetAppPath) === path.resolve(plan.stagedAppPath)) throw new Error('The target and staged applications must be different paths.');
-  if (requireTransaction && (!plan.transactionId || !/^[0-9a-f-]{36}$/i.test(plan.transactionId) || !plan.expectedAppIdentity || !/^[0-9a-f]{64}$/i.test(plan.expectedAppIdentity) || !plan.knownGoodApplicationIdentity || !/^[0-9a-f]{64}$/i.test(plan.knownGoodApplicationIdentity))) throw new Error('The update plan is missing its transaction or application identity.');
+  if (requireTransaction && (!plan.transactionId || !/^[0-9a-f-]{36}$/i.test(plan.transactionId) || !plan.transactionAuthorization || !/^[0-9a-f]{64}$/i.test(plan.transactionAuthorization) || !plan.expectedAppIdentity || !/^[0-9a-f]{64}$/i.test(plan.expectedAppIdentity) || !plan.knownGoodApplicationIdentity || !/^[0-9a-f]{64}$/i.test(plan.knownGoodApplicationIdentity))) throw new Error('The update plan is missing its transaction authorization or application identity.');
 }
 
 function isSafeStatusPath(plan: UpdatePlan, expectedAppPath?: string, expectedUserDataPath?: string): boolean {
@@ -245,7 +235,7 @@ async function waitForVerifiedStatus(statusPath: string, version: string, timeou
 
 async function assertLockOwnership(plan: UpdatePlan): Promise<void> {
   if (!plan.transactionId) throw new Error('The update plan has no transaction identity.');
-  let lock: { pid?: unknown; createdAt?: unknown; transactionId?: unknown };
+  let lock: { pid?: unknown; createdAt?: unknown; transactionId?: unknown; transactionAuthorization?: unknown };
   try {
     const stat = await fs.lstat(plan.lockPath);
     if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || (stat.mode & 0o077) !== 0) throw new Error('The update transaction lock is not an authenticated regular file.');
@@ -253,7 +243,7 @@ async function assertLockOwnership(plan: UpdatePlan): Promise<void> {
   } catch {
     throw new Error('The update transaction lock is missing or invalid.');
   }
-  if (lock.transactionId !== plan.transactionId || typeof lock.createdAt !== 'string' || typeof lock.pid !== 'number' || !Number.isInteger(lock.pid) || lock.pid <= 0) throw new Error('The update transaction lock belongs to a different or unauthenticated transaction.');
+  if (lock.transactionId !== plan.transactionId || lock.transactionAuthorization !== plan.transactionAuthorization || typeof lock.createdAt !== 'string' || typeof lock.pid !== 'number' || !Number.isInteger(lock.pid) || lock.pid <= 0) throw new Error('The update transaction lock belongs to a different or unauthenticated transaction.');
 }
 
 async function releaseOwnedUpdateLock(plan: UpdatePlan): Promise<void> {
@@ -298,7 +288,7 @@ async function assertPathAbsent(filePath: string): Promise<void> {
 }
 
 async function writePendingStatus(plan: UpdatePlan): Promise<void> {
-  await writeUpdateStatus(plan.statusPath, { state: 'pending', version: plan.newVersion, message: `lucifold ${plan.newVersion} is preparing a recoverable installation.`, timestamp: new Date().toISOString(), backupPath: plan.backupPath, backupRoot: plan.backupRoot, backupOwnershipMarker: plan.backupOwnershipMarker ?? path.join(plan.backupRoot, '.lucifold-owner'), lockPath: plan.lockPath, stagingRoot: plan.stagingRoot, targetAppPath: plan.targetAppPath, transactionId: plan.transactionId, applicationIdentity: plan.expectedAppIdentity, knownGoodApplicationIdentity: plan.knownGoodApplicationIdentity });
+  await writeUpdateStatus(plan.statusPath, { state: 'pending', version: plan.newVersion, message: `lucifold ${plan.newVersion} is preparing a recoverable installation.`, timestamp: new Date().toISOString(), backupPath: plan.backupPath, backupRoot: plan.backupRoot, backupOwnershipMarker: plan.backupOwnershipMarker ?? path.join(plan.backupRoot, '.lucifold-owner'), lockPath: plan.lockPath, stagingRoot: plan.stagingRoot, targetAppPath: plan.targetAppPath, transactionId: plan.transactionId, transactionAuthorization: plan.transactionAuthorization, applicationIdentity: plan.expectedAppIdentity, knownGoodApplicationIdentity: plan.knownGoodApplicationIdentity });
 }
 
 async function pathExists(filePath: string): Promise<boolean> {
@@ -378,10 +368,10 @@ function recoveryPlan(status: NonNullable<Awaited<ReturnType<typeof readUpdateSt
   const backupOwnershipMarker = status.backupOwnershipMarker;
   const stagingRoot = status.stagingRoot;
   const lockPath = status.lockPath;
-  if (!backupPath || !backupRoot || !backupOwnershipMarker || !stagingRoot || !lockPath || !status.transactionId || !status.knownGoodApplicationIdentity || !/^[0-9a-f]{64}$/i.test(status.knownGoodApplicationIdentity) || !isPathWithin(backupPath, path.join(userDataPath, 'update-backups')) || !isPathWithin(backupRoot, path.join(userDataPath, 'update-backups')) || path.resolve(backupOwnershipMarker) !== path.resolve(path.join(backupRoot, '.lucifold-owner')) || !isPathWithin(stagingRoot, os.tmpdir()) || path.resolve(lockPath) !== path.resolve(path.join(userDataPath, 'update.lock'))) return null;
+  if (!backupPath || !backupRoot || !backupOwnershipMarker || !stagingRoot || !lockPath || !status.transactionId || !status.transactionAuthorization || !status.knownGoodApplicationIdentity || !/^[0-9a-f]{64}$/i.test(status.knownGoodApplicationIdentity) || !isPathWithin(backupPath, path.join(userDataPath, 'update-backups')) || !isPathWithin(backupRoot, path.join(userDataPath, 'update-backups')) || path.resolve(backupOwnershipMarker) !== path.resolve(path.join(backupRoot, '.lucifold-owner')) || !isPathWithin(stagingRoot, os.tmpdir()) || path.resolve(lockPath) !== path.resolve(path.join(userDataPath, 'update.lock'))) return null;
   const newVersion = status.version;
   if (!newVersion || !isApprovedTag(`v${newVersion}`)) return null;
-  return { version: UPDATE_PLAN_VERSION, parentPid: process.pid, targetAppPath: currentAppPath, stagedAppPath: path.join(stagingRoot, 'source', 'release', 'mac-arm64', 'lucifold.app'), stagingRoot, userDataPath, backupRoot, backupPath, backupOwnershipMarker, lockPath, statusPath: path.join(userDataPath, 'update-status.json'), newVersion, targetExecutable: path.join(currentAppPath, 'Contents', 'MacOS', 'lucifold'), transactionId: status.transactionId, expectedAppIdentity: status.applicationIdentity, knownGoodApplicationIdentity: status.knownGoodApplicationIdentity };
+  return { version: UPDATE_PLAN_VERSION, parentPid: process.pid, targetAppPath: currentAppPath, stagedAppPath: path.join(stagingRoot, 'source', 'release', 'mac-arm64', 'lucifold.app'), stagingRoot, userDataPath, backupRoot, backupPath, backupOwnershipMarker, lockPath, statusPath: path.join(userDataPath, 'update-status.json'), newVersion, targetExecutable: path.join(currentAppPath, 'Contents', 'MacOS', 'lucifold'), transactionId: status.transactionId, transactionAuthorization: status.transactionAuthorization, expectedAppIdentity: status.applicationIdentity, knownGoodApplicationIdentity: status.knownGoodApplicationIdentity };
 }
 
 async function assertKnownGoodApplication(plan: UpdatePlan): Promise<void> {
@@ -393,11 +383,11 @@ async function assertKnownGoodBackup(plan: UpdatePlan): Promise<void> {
 }
 
 async function assertBackupOwnership(plan: UpdatePlan): Promise<void> {
-  if (!plan.transactionId) throw new Error('The update transaction has no identity.');
+  if (!plan.transactionId || !plan.transactionAuthorization) throw new Error('The update transaction has no authenticated capability.');
   const marker = plan.backupOwnershipMarker ?? path.join(plan.backupRoot, '.lucifold-owner');
   const stat = await fs.lstat(marker);
   if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || (stat.mode & 0o077) !== 0) throw new Error('The recovery backup ownership marker is invalid.');
-  if ((await fs.readFile(marker, 'utf8')).trim() !== plan.transactionId) throw new Error('The recovery backup belongs to a different transaction.');
+  if ((await fs.readFile(marker, 'utf8')).trim() !== plan.transactionAuthorization) throw new Error('The recovery backup belongs to a different transaction.');
 }
 
 function launchInstalledApp(executable: string, args: string[]): void {

@@ -7,7 +7,7 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import test from 'node:test';
 import { performInstallationForTest, recoverInterruptedUpdate, runUpdateHelper } from '../src/main/services/update-helper.js';
-import { applicationIdentity, compareVersions, extractVerifiedArchiveForTest, isApprovedTag, isExpectedOrigin, isPathWithin, markUpdateVerified, readUpdateStatus, resolveVerificationUserDataPath, validateArchiveEntries, writeUpdateStatus, UpdateService, type CommandRunner, type UpdatePlan } from '../src/main/services/update-service.js';
+import { applicationIdentity, compareVersions, extractVerifiedArchiveForTest, isApprovedTag, isExpectedOrigin, isPathWithin, markUpdateVerified, prepareVerificationSessionDataPath, readUpdateStatus, resolveVerificationUserDataPath, validateArchiveEntries, writeUpdateStatus, UpdateService, type CommandRunner, type UpdatePlan } from '../src/main/services/update-service.js';
 import { parseUpdaterArguments } from '../src/main/services/verification-arguments.js';
 
 const execFile = promisify(execFileCallback);
@@ -83,11 +83,12 @@ async function createProductionPlan(root: string, mode: 'success' | 'fail' | 're
     newVersion: '1.0.3',
     targetExecutable: path.join(targetAppPath, 'Contents', 'MacOS', 'lucifold'),
     transactionId: '22222222-2222-4222-8222-222222222222',
+    transactionAuthorization: 'a'.repeat(64),
     expectedAppIdentity: await applicationIdentity(stagedAppPath),
     knownGoodApplicationIdentity: await applicationIdentity(targetAppPath),
   };
   await fs.mkdir(userDataPath, { recursive: true });
-  await fs.writeFile(plan.lockPath, JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString(), transactionId: plan.transactionId }), { mode: 0o600 });
+  await fs.writeFile(plan.lockPath, JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString(), transactionId: plan.transactionId, transactionAuthorization: plan.transactionAuthorization }), { mode: 0o600 });
   return { plan, planPath: path.join(stagingRoot, 'update-plan.json') };
 }
 
@@ -131,9 +132,10 @@ test('update verification resolves and validates one authenticated user-data pat
   const identity = 'a'.repeat(64);
   const lockPath = path.join(userDataPath, 'update.lock');
   const transactionId = '33333333-3333-4333-8333-333333333333';
+  const transactionAuthorization = 'c'.repeat(64);
   await fs.mkdir(userDataPath, { recursive: true });
-  await fs.writeFile(lockPath, JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString(), transactionId }), { mode: 0o600 });
-  await writeUpdateStatus(statusPath, { state: 'pending', version: '1.0.3', message: 'pending', timestamp: new Date().toISOString(), targetAppPath: currentAppPath, transactionId, lockPath, applicationIdentity: identity });
+  await fs.writeFile(lockPath, JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString(), transactionId, transactionAuthorization }), { mode: 0o600 });
+  await writeUpdateStatus(statusPath, { state: 'pending', version: '1.0.3', message: 'pending', timestamp: new Date().toISOString(), targetAppPath: currentAppPath, transactionId, transactionAuthorization, lockPath, applicationIdentity: identity });
   assert.equal(resolveVerificationUserDataPath(statusPath, '1.0.3', identity, currentAppPath), null);
   assert.equal(resolveVerificationUserDataPath(statusPath, '1.0.3', identity, currentAppPath, userDataPath, userDataPath), userDataPath);
   assert.equal(resolveVerificationUserDataPath(statusPath, '1.0.3', identity, currentAppPath, userDataPath, path.join(root, 'redirected-data')), null);
@@ -186,13 +188,41 @@ test('startup verification accepts only the current application and version once
   const identity = await applicationIdentity(appPath);
   const lockPath = path.join(userDataPath, 'update.lock');
   const transactionId = '44444444-4444-4444-8444-444444444444';
+  const transactionAuthorization = 'd'.repeat(64);
   await fs.mkdir(userDataPath, { recursive: true });
-  await fs.writeFile(lockPath, JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString(), transactionId }), { mode: 0o600 });
-  await writeUpdateStatus(statusPath, { state: 'pending', version: '1.0.3', message: 'pending', timestamp: new Date().toISOString(), targetAppPath: appPath, transactionId, lockPath, applicationIdentity: identity });
+  await fs.writeFile(lockPath, JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString(), transactionId, transactionAuthorization }), { mode: 0o600 });
+  await writeUpdateStatus(statusPath, { state: 'pending', version: '1.0.3', message: 'pending', timestamp: new Date().toISOString(), targetAppPath: appPath, transactionId, transactionAuthorization, lockPath, applicationIdentity: identity });
   assert.equal(await markUpdateVerified(statusPath, '1.0.3', '1.0.3', appPath, identity, userDataPath), true);
   assert.equal((await readUpdateStatus(statusPath))?.state, 'verified');
   assert.equal(await markUpdateVerified(statusPath, '1.0.3', '1.0.3', appPath, identity, userDataPath), false);
   assert.equal(resolveVerificationUserDataPath(statusPath, '1.0.3', identity, appPath, undefined, userDataPath), null);
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test('verification session storage rejects symlinks, external populations, hard links, and replacement', async () => {
+  const root = await temporaryDirectory('lucifold-session-data-');
+  const canonical = path.join(root, 'user-data');
+  await fs.mkdir(canonical, { recursive: true, mode: 0o700 });
+  const session = prepareVerificationSessionDataPath(canonical);
+  assert.equal(session, path.join(canonical, 'session-data'));
+  const external = path.join(root, 'external-session');
+  await fs.mkdir(external, { mode: 0o700 });
+  await fs.writeFile(path.join(external, 'sentinel'), 'must-remain');
+  await fs.rm(session, { recursive: true, force: true });
+  await fs.symlink(external, session, 'dir');
+  assert.equal(prepareVerificationSessionDataPath(canonical), null);
+  assert.equal(await fs.readFile(path.join(external, 'sentinel'), 'utf8'), 'must-remain');
+  await fs.rm(session);
+  const hardLinkSource = path.join(root, 'session-file');
+  await fs.writeFile(hardLinkSource, 'not-a-directory');
+  await fs.link(hardLinkSource, session);
+  assert.equal(prepareVerificationSessionDataPath(canonical), null);
+  await fs.rm(session);
+  await fs.mkdir(session, { mode: 0o700 });
+  assert.equal(prepareVerificationSessionDataPath(canonical), session);
+  await fs.rm(session, { recursive: true });
+  await fs.symlink(external, session, 'dir');
+  assert.equal(prepareVerificationSessionDataPath(canonical), null);
   await fs.rm(root, { recursive: true, force: true });
 });
 
@@ -729,10 +759,11 @@ test('startup recovery restores the known-good app after an interrupted pending 
   await fs.writeFile(completedExportPath, 'completed export');
   const preservedData = await Promise.all([settingsPath, presetsPath, originalsPath, completedExportPath].map(async (filePath) => [filePath, await fs.readFile(filePath, 'utf8')] as const));
   const transactionId = '11111111-1111-4111-8111-111111111111';
-  await fs.writeFile(lockPath, JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString(), transactionId }), { mode: 0o600 });
+  const transactionAuthorization = 'b'.repeat(64);
+  await fs.writeFile(lockPath, JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString(), transactionId, transactionAuthorization }), { mode: 0o600 });
   const backupOwnershipMarker = path.join(backupRoot, '.lucifold-owner');
-  await fs.writeFile(backupOwnershipMarker, `${transactionId}\n`, { mode: 0o600 });
-  await writeUpdateStatus(statusPath, { state: 'pending', version: '1.0.1', message: 'pending', timestamp: new Date().toISOString(), backupPath: backup, backupRoot, backupOwnershipMarker, lockPath, stagingRoot, targetAppPath: target, transactionId, applicationIdentity: knownGoodIdentity, knownGoodApplicationIdentity: knownGoodIdentity });
+  await fs.writeFile(backupOwnershipMarker, `${transactionAuthorization}\n`, { mode: 0o600 });
+  await writeUpdateStatus(statusPath, { state: 'pending', version: '1.0.1', message: 'pending', timestamp: new Date().toISOString(), backupPath: backup, backupRoot, backupOwnershipMarker, lockPath, stagingRoot, targetAppPath: target, transactionId, transactionAuthorization, applicationIdentity: knownGoodIdentity, knownGoodApplicationIdentity: knownGoodIdentity });
   await recoverInterruptedUpdate(data, target, '1.0.0');
   assert.equal(await fs.readFile(path.join(target, 'Contents', 'MacOS', 'lucifold'), 'utf8'), 'known-good');
   const status = await readUpdateStatus(statusPath);
@@ -780,7 +811,7 @@ test('production helper rejects a plan bound to an alternate user-data directory
   plan.backupRoot = path.join(alternateUserDataPath, 'update-backups', 'integration');
   plan.backupPath = path.join(plan.backupRoot, 'lucifold.app');
   await fs.mkdir(alternateUserDataPath, { recursive: true });
-  await fs.writeFile(plan.lockPath, JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString(), transactionId: plan.transactionId }), { mode: 0o600 });
+  await fs.writeFile(plan.lockPath, JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString(), transactionId: plan.transactionId, transactionAuthorization: plan.transactionAuthorization }), { mode: 0o600 });
   await fs.writeFile(planPath, JSON.stringify(plan));
   await assert.rejects(runUpdateHelper(planPath, { expectedUserDataPath: path.join(root, 'data') }), /user-data directory/i);
   assert.equal(await fs.readFile(path.join(plan.targetAppPath, 'marker.txt'), 'utf8'), 'known-good');
@@ -817,9 +848,28 @@ test('production helper refuses a pre-existing backup root without deleting its 
   const sentinel = path.join(plan.backupRoot, 'unrelated.txt');
   await fs.writeFile(sentinel, 'must-remain');
   await fs.writeFile(planPath, JSON.stringify(plan));
+  const originalLock = await fs.readFile(plan.lockPath);
   await assert.rejects(runUpdateHelper(planPath, { expectedUserDataPath: plan.userDataPath }), /EEXIST|existing|installation/i);
   assert.equal(await fs.readFile(sentinel, 'utf8'), 'must-remain');
   assert.equal(await fs.readFile(path.join(plan.targetAppPath, 'marker.txt'), 'utf8'), 'known-good');
+  assert.deepEqual(await fs.readFile(plan.lockPath), originalLock);
+  await assert.rejects(fs.access(plan.statusPath));
+  await fs.access(plan.stagingRoot);
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test('startup recovery does not rewrite an unauthenticated incomplete status record', async () => {
+  const root = await temporaryDirectory('lucifold-recovery-unauthorized-status-');
+  const data = path.join(root, 'data');
+  const appPath = path.join(root, 'installed', 'lucifold.app');
+  const statusPath = path.join(data, 'update-status.json');
+  await fs.mkdir(path.dirname(appPath), { recursive: true });
+  await fs.mkdir(data, { recursive: true, mode: 0o700 });
+  await createFixtureApp(appPath, 'exit 0', 'known-good');
+  const status = JSON.stringify({ state: 'pending', version: '1.0.3', message: 'forged', timestamp: new Date().toISOString() });
+  await fs.writeFile(statusPath, status);
+  await recoverInterruptedUpdate(data, appPath, '1.0.2');
+  assert.equal(await fs.readFile(statusPath, 'utf8'), status);
   await fs.rm(root, { recursive: true, force: true });
 });
 

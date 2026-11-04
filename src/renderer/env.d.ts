@@ -6,6 +6,7 @@ interface LucifoldAPI {
   chooseFiles(): Promise<string[]>;
   chooseFolder(): Promise<string | null>;
   importPaths(paths: string[]): Promise<ImportResponse>;
+  getPathForDroppedFile(file: File): string | null;
   getQueue(): Promise<{ items: QueueItem[]; batch: BatchState }>;
   removeItems(ids: string[]): Promise<QueueItem[]>;
   clearQueue(): Promise<QueueItem[]>;

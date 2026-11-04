@@ -1,4 +1,4 @@
-import { contextBridge, ipcRenderer } from 'electron';
+import { contextBridge, ipcRenderer, webUtils } from 'electron';
 import type { AppInfo, AppSettings, ExportReport, ExportRequest, ImportResponse, OptimizationRequest, Preset, QueueUpdate, UpdateCheckResult, UpdateInstallResponse, UpdateProgress } from '../shared/types.js';
 
 const api = {
@@ -7,6 +7,9 @@ const api = {
   chooseFiles: () => ipcRenderer.invoke('dialog:choose-files') as Promise<string[]>,
   chooseFolder: () => ipcRenderer.invoke('dialog:choose-folder') as Promise<string | null>,
   importPaths: (paths: string[]) => ipcRenderer.invoke('import:paths', paths) as Promise<ImportResponse>,
+  getPathForDroppedFile: (file: File) => {
+    try { return webUtils.getPathForFile(file) || null; } catch { return null; }
+  },
   getQueue: () => ipcRenderer.invoke('queue:get'),
   removeItems: (ids: string[]) => ipcRenderer.invoke('queue:remove', ids),
   clearQueue: () => ipcRenderer.invoke('queue:clear'),
