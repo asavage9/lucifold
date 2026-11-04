@@ -63,6 +63,7 @@ export interface UpdatePlan {
   userDataPath: string;
   backupRoot: string;
   backupPath: string;
+  backupOwnershipMarker?: string;
   lockPath: string;
   statusPath: string;
   newVersion: string;
@@ -228,6 +229,7 @@ export class UpdateService {
         userDataPath: this.options.userDataPath,
         backupRoot,
         backupPath,
+        backupOwnershipMarker: path.join(backupRoot, '.lucifold-owner'),
         lockPath,
         statusPath: path.join(this.options.userDataPath, 'update-status.json'),
         newVersion: tag.slice(1),
@@ -673,9 +675,9 @@ export async function applicationIdentity(appPath: string): Promise<string> {
   return digest.digest('hex');
 }
 
-export async function markUpdateVerified(statusPath: string, expectedVersion: string, actualVersion: string, currentAppPath?: string, expectedIdentity?: string): Promise<boolean> {
+export async function markUpdateVerified(statusPath: string, expectedVersion: string, actualVersion: string, currentAppPath?: string, expectedIdentity?: string, canonicalUserDataPath?: string): Promise<boolean> {
   if (expectedVersion !== actualVersion) return false;
-  if (!currentAppPath || !expectedIdentity || !resolveVerificationUserDataPath(statusPath, expectedVersion, expectedIdentity, currentAppPath)) return false;
+  if (!currentAppPath || !expectedIdentity || !canonicalUserDataPath || !resolveVerificationUserDataPath(statusPath, expectedVersion, expectedIdentity, currentAppPath, undefined, canonicalUserDataPath)) return false;
   const current = await readUpdateStatus(statusPath);
   if (!current || current.state !== 'pending' || current.version !== expectedVersion) return false;
   if (!current.targetAppPath || path.resolve(current.targetAppPath) !== path.resolve(currentAppPath) || expectedIdentity !== current.applicationIdentity) return false;
@@ -684,20 +686,25 @@ export async function markUpdateVerified(statusPath: string, expectedVersion: st
   return true;
 }
 
-export function resolveVerificationUserDataPath(statusPath: string, expectedVersion: string, expectedIdentity: string, currentAppPath: string, requestedPath?: string): string | null {
-  if (!path.isAbsolute(statusPath) || path.basename(statusPath) !== 'update-status.json' || !isApprovedTag(`v${expectedVersion}`) || !/^[0-9a-f]{64}$/i.test(expectedIdentity) || !path.isAbsolute(currentAppPath)) return null;
+export function resolveVerificationUserDataPath(statusPath: string, expectedVersion: string, expectedIdentity: string, currentAppPath: string, requestedPath?: string, canonicalUserDataPath?: string): string | null {
+  if (!canonicalUserDataPath || !path.isAbsolute(statusPath) || path.basename(statusPath) !== 'update-status.json' || !isApprovedTag(`v${expectedVersion}`) || !/^[0-9a-f]{64}$/i.test(expectedIdentity) || !path.isAbsolute(currentAppPath) || !path.isAbsolute(canonicalUserDataPath)) return null;
+  if (path.resolve(path.dirname(statusPath)) !== path.resolve(canonicalUserDataPath) || path.resolve(statusPath) !== path.resolve(path.join(canonicalUserDataPath, 'update-status.json'))) return null;
   let status: UpdateStatusRecord;
+  let lock: { pid?: unknown; transactionId?: unknown; createdAt?: unknown };
   try {
     const statusStat = lstatSync(statusPath);
     const userDataStat = lstatSync(path.dirname(statusPath));
-    if (!statusStat.isFile() || statusStat.isSymbolicLink() || !userDataStat.isDirectory() || userDataStat.isSymbolicLink()) return null;
+    const lockPath = path.join(canonicalUserDataPath, 'update.lock');
+    const lockStat = lstatSync(lockPath);
+    if (!statusStat.isFile() || statusStat.isSymbolicLink() || statusStat.nlink !== 1 || !userDataStat.isDirectory() || userDataStat.isSymbolicLink() || !lockStat.isFile() || lockStat.isSymbolicLink() || lockStat.nlink !== 1 || (lockStat.mode & 0o077) !== 0) return null;
     if (hasUntrustedSymlink(statusPath) || hasUntrustedSymlink(path.dirname(statusPath))) return null;
     status = JSON.parse(readFileSync(statusPath, 'utf8')) as UpdateStatusRecord;
+    lock = JSON.parse(readFileSync(lockPath, 'utf8')) as typeof lock;
   } catch {
     return null;
   }
-  const userDataPath = path.dirname(statusPath);
-  if (!path.isAbsolute(userDataPath) || path.resolve(userDataPath) === path.parse(userDataPath).root || status.state !== 'pending' || status.version !== expectedVersion || status.targetAppPath !== path.resolve(currentAppPath) || status.applicationIdentity !== expectedIdentity || !status.transactionId || !/^[0-9a-f-]{36}$/i.test(status.transactionId)) return null;
+  const userDataPath = path.resolve(canonicalUserDataPath);
+  if (userDataPath === path.parse(userDataPath).root || status.state !== 'pending' || status.version !== expectedVersion || status.targetAppPath !== path.resolve(currentAppPath) || status.applicationIdentity !== expectedIdentity || !status.lockPath || path.resolve(status.lockPath) !== path.resolve(path.join(userDataPath, 'update.lock')) || !status.transactionId || !/^[0-9a-f-]{36}$/i.test(status.transactionId) || lock.transactionId !== status.transactionId || typeof lock.createdAt !== 'string' || typeof lock.pid !== 'number' || !Number.isInteger(lock.pid) || lock.pid <= 0) return null;
   if (requestedPath !== undefined && (!path.isAbsolute(requestedPath) || path.resolve(requestedPath) !== path.resolve(userDataPath))) return null;
   return userDataPath;
 }

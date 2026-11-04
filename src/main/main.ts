@@ -6,9 +6,10 @@ import { registerIpc } from './ipc.js';
 import { isAllowedRendererUrl } from './ipc-security.js';
 import { isApprovedTag, markUpdateVerified, resolveVerificationUserDataPath } from './services/update-service.js';
 import { recoverInterruptedUpdate, runUpdateHelper } from './services/update-helper.js';
+import { parseUpdaterArguments } from './services/verification-arguments.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-let pendingStartupVerification: { statusPath: string; version: string; identity: string; appPath: string } | null = null;
+let pendingStartupVerification: { statusPath: string; version: string; identity: string; appPath: string; canonicalUserDataPath: string } | null = null;
 
 function createWindow(): BrowserWindow {
   const window = new BrowserWindow({
@@ -39,24 +40,27 @@ function createWindow(): BrowserWindow {
     const verification = pendingStartupVerification;
     if (verification) {
       pendingStartupVerification = null;
-      void markUpdateVerified(verification.statusPath, verification.version, app.getVersion(), verification.appPath, verification.identity).catch((error) => console.warn('lucifold update verification could not be recorded', error));
+      void markUpdateVerified(verification.statusPath, verification.version, app.getVersion(), verification.appPath, verification.identity, verification.canonicalUserDataPath).catch((error) => console.warn('lucifold update verification could not be recorded', error));
     }
   });
   registerIpc(window);
   return window;
 }
 
-const helperPlanPath = argumentAfter('--lucifold-update-helper');
-const verificationStatusPath = argumentAfter('--lucifold-update-verify');
-const verificationVersion = verificationStatusPath ? process.argv[process.argv.indexOf('--lucifold-update-verify') + 2] : undefined;
-const verificationIdentity = verificationStatusPath ? process.argv[process.argv.indexOf('--lucifold-update-verify') + 3] : undefined;
-const requestedUserDataPath = argumentAfter('--user-data-dir');
+const parsedUpdaterArguments = parseUpdaterArguments(process.argv);
+const helperPlanPath = parsedUpdaterArguments.kind === 'helper' ? parsedUpdaterArguments.planPath : undefined;
+const verificationStatusPath = parsedUpdaterArguments.kind === 'verification' ? parsedUpdaterArguments.statusPath : undefined;
+const verificationVersion = parsedUpdaterArguments.kind === 'verification' ? parsedUpdaterArguments.version : undefined;
+const verificationIdentity = parsedUpdaterArguments.kind === 'verification' ? parsedUpdaterArguments.identity : undefined;
+const requestedUserDataPath = parsedUpdaterArguments.kind === 'verification' ? parsedUpdaterArguments.userDataPath : undefined;
+const canonicalApplicationDataPath = path.join(app.getPath('appData'), app.getName());
+app.setPath('userData', canonicalApplicationDataPath);
 const currentAppPath = bundlePathFromExecutable(process.execPath);
 const verificationUserDataPath = verificationStatusPath && verificationVersion && verificationIdentity && currentAppPath
-  ? resolveVerificationUserDataPath(verificationStatusPath, verificationVersion, verificationIdentity, currentAppPath, requestedUserDataPath)
+  ? resolveVerificationUserDataPath(verificationStatusPath, verificationVersion, verificationIdentity, currentAppPath, requestedUserDataPath, canonicalApplicationDataPath)
   : null;
 
-if (verificationStatusPath && verificationVersion && verificationIdentity && !verificationUserDataPath) {
+if (parsedUpdaterArguments.kind === 'invalid' || (verificationStatusPath && verificationVersion && verificationIdentity && !verificationUserDataPath)) {
   console.error('lucifold update verification arguments were rejected.');
   app.exit(1);
 } else if (verificationUserDataPath) {
@@ -79,7 +83,7 @@ app.whenReady().then(async () => {
   }
 
   if (verificationStatusPath && verificationVersion && verificationIdentity && isSafeVerificationArguments(verificationStatusPath, verificationVersion, verificationIdentity)) {
-    if (currentAppPath) pendingStartupVerification = { statusPath: verificationStatusPath, version: verificationVersion, identity: verificationIdentity, appPath: currentAppPath };
+    if (currentAppPath) pendingStartupVerification = { statusPath: verificationStatusPath, version: verificationVersion, identity: verificationIdentity, appPath: currentAppPath, canonicalUserDataPath: canonicalApplicationDataPath };
   } else if (app.isPackaged) {
     if (currentAppPath) await recoverInterruptedUpdate(app.getPath('userData'), currentAppPath, app.getVersion()).catch((error) => console.warn('lucifold interrupted update recovery failed', error));
   }
@@ -92,11 +96,6 @@ app.whenReady().then(async () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
 });
-
-function argumentAfter(argument: string): string | undefined {
-  const index = process.argv.indexOf(argument);
-  return index >= 0 ? process.argv[index + 1] : undefined;
-}
 
 function isAllowedRendererNavigation(value: string): boolean {
   return isAllowedRendererUrl(value, path.resolve(__dirname, '../../renderer/index.html'), app.isPackaged);

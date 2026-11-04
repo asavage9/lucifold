@@ -154,6 +154,8 @@ export interface UpdateStatusRecord {
   message: string;
   timestamp: string;
   backupPath?: string;
+  backupRoot?: string;
+  backupOwnershipMarker?: string;
   lockPath?: string;
   stagingRoot?: string;
   targetAppPath?: string;
