@@ -836,7 +836,19 @@ async function resetBuildOutput(releaseRoot: string, sourceRoot: string): Promis
     throw error;
   });
   if (stat && (!stat.isDirectory() || stat.isSymbolicLink() || hasUntrustedSymlink(releaseRoot))) throw new Error('The staging output directory is not a trusted directory.');
-  await fs.rm(releaseRoot, { recursive: true, force: true });
+  if (stat) {
+    // Quarantine the complete invalid output before deleting it. This avoids
+    // recursively removing a directory while the packager may still have
+    // open handles or be traversing its populated bundle on macOS.
+    const quarantineRoot = path.join(sourceRoot, `.lucifold-release-reset-${randomUUID()}`);
+    await fs.rename(releaseRoot, quarantineRoot);
+    try {
+      await fs.rm(quarantineRoot, { recursive: true, force: true });
+    } catch (error) {
+      await fs.rename(quarantineRoot, releaseRoot).catch(() => undefined);
+      throw error;
+    }
+  }
   await fs.mkdir(releaseRoot, { recursive: true, mode: 0o700 });
 }
 
