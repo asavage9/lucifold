@@ -7,7 +7,7 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import test from 'node:test';
 import { performInstallationForTest, recoverInterruptedUpdate, runUpdateHelper } from '../src/main/services/update-helper.js';
-import { applicationIdentity, compareVersions, extractVerifiedArchiveForTest, isApprovedTag, isExpectedOrigin, isPathWithin, markUpdateVerified, readUpdateStatus, resolveVerificationUserDataPath, validateArchiveEntries, writeUpdateStatus, UpdateService, type CommandRunner, type UpdatePlan } from '../src/main/services/update-service.js';
+import { applicationIdentity, assertApplicationBundle, assertStableApplicationBundle, compareVersions, extractVerifiedArchiveForTest, findApplicationBundle, isApprovedTag, isExpectedOrigin, isPathWithin, markUpdateVerified, readUpdateStatus, resolveVerificationUserDataPath, validateArchiveEntries, writeUpdateStatus, UpdateService, type CommandRunner, type UpdatePlan } from '../src/main/services/update-service.js';
 import { resolveCanonicalApplicationDataPath } from '../src/main/services/application-paths.js';
 import { parseUpdaterArguments } from '../src/main/services/verification-arguments.js';
 
@@ -104,6 +104,40 @@ test('update validation accepts only stable tags and strict path containment', (
   assert.equal(isPathWithin('/tmp/lucifold-update-1/source', '/tmp/lucifold-update-1'), true);
   assert.equal(isPathWithin('/tmp/lucifold-update-1/../outside', '/tmp/lucifold-update-1'), false);
   assert.equal(isPathWithin('/tmp/lucifold-update-1', '/tmp/lucifold-update-1'), false);
+});
+
+test('staging validation requires the exact complete arm64 bundle and rejects incomplete or relocated output', async () => {
+  const root = await temporaryDirectory('lucifold-staging-validation-');
+  const releaseRoot = path.join(root, 'release');
+  const wrongLocation = path.join(releaseRoot, 'wrong-location', 'lucifold.app');
+  const expected = path.join(releaseRoot, 'mac-arm64', 'lucifold.app');
+  await fs.mkdir(releaseRoot, { recursive: true });
+  await createFixtureApp(wrongLocation, 'exit 0', 'wrong-location');
+  assert.equal(await findApplicationBundle(releaseRoot), null);
+
+  await fs.mkdir(path.join(expected, 'Contents', 'MacOS'), { recursive: true });
+  await fs.mkdir(path.join(expected, 'Contents', 'Resources'), { recursive: true });
+  await fs.writeFile(path.join(expected, 'Contents', 'MacOS', 'lucifold'), '#!/bin/sh\nexit 0\n');
+  await fs.writeFile(path.join(expected, 'Contents', 'Info.plist'), 'incomplete');
+  assert.equal(await findApplicationBundle(releaseRoot), expected);
+  await assert.rejects(assertApplicationBundle(expected), /incomplete|ENOENT/i);
+
+  await fs.writeFile(path.join(expected, 'Contents', 'Resources', 'app.asar'), 'complete');
+  await assert.doesNotReject(assertApplicationBundle(expected));
+  await assert.doesNotReject(assertStableApplicationBundle(expected));
+  await fs.rm(path.join(expected, 'Contents', 'Resources', 'app.asar'));
+  const delayedOutput = Promise.resolve().then(() => fs.writeFile(path.join(expected, 'Contents', 'Resources', 'app.asar'), 'delayed-output'));
+  await assert.rejects(assertStableApplicationBundle(expected), /incomplete|ENOENT/i);
+  await delayedOutput;
+  const relocated = path.join(releaseRoot, 'mac-x64', 'lucifold.app');
+  await createFixtureApp(relocated, 'exit 0', 'relocated');
+  assert.equal(await findApplicationBundle(releaseRoot), expected);
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test('the updater package command disables implicit CI publishing', async () => {
+  const manifest = JSON.parse(await fs.readFile(path.resolve('package.json'), 'utf8')) as { scripts?: Record<string, string> };
+  assert.equal(manifest.scripts?.['package:dir'], 'npm run build && electron-builder --mac --arm64 --dir --publish never');
 });
 
 test('updater argument parsing rejects incomplete, conflicting, duplicate, and malformed verification vectors', () => {

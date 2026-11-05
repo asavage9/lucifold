@@ -31,10 +31,30 @@ const CONTROLLED_EXECUTABLES: Record<string, string[]> = {
 export interface CommandResult {
   stdout: string;
   stderr: string;
+  exitCode?: number | null;
+  signal?: NodeJS.Signals | null;
+  pid?: number;
+  startedAt?: string;
+  exitedAt?: string;
+  closedAt?: string;
 }
 
 export type CommandRunner = (command: string, args: string[], cwd?: string, timeout?: number) => Promise<CommandResult>;
 export type HelperLauncher = (executable: string, args: string[], cwd: string) => void;
+
+interface StagingCommandEvent {
+  command: string;
+  args: string[];
+  cwd?: string;
+  startedAt: string;
+  completedAt: string;
+  pid?: number;
+  exitCode?: number | null;
+  signal?: NodeJS.Signals | null;
+  stdout?: string;
+  stderr?: string;
+  error?: { name: string; message: string; exitCode?: number | null; signal?: NodeJS.Signals | null };
+}
 
 export interface RepositoryInspection {
   root: string;
@@ -172,6 +192,7 @@ export class UpdateService {
     let lockAcquired = false;
     let transactionId: string | undefined;
     let transactionAuthorization: string | undefined;
+    const commandEvents: StagingCommandEvent[] = [];
     const source = await this.resolveSourceRepository(sourceRepositoryPath);
     if (!source) return { accepted: false, message: 'The trusted local lucifold repository is not configured.' };
 
@@ -195,7 +216,7 @@ export class UpdateService {
       await fs.mkdir(sourceRoot, { recursive: true, mode: 0o700 });
       const archivePath = path.join(stagingRoot, 'source.tar');
       await this.assertRevisionTreeSafe(inspection.repository.root, verifiedCommit);
-      await this.runCommand('git', ['archive', '--format=tar', `--output=${archivePath}`, verifiedCommit], inspection.repository.root, COMMAND_TIMEOUT);
+      await runStagingCommand(this.runCommand, commandEvents, 'git', ['archive', '--format=tar', `--output=${archivePath}`, verifiedCommit], inspection.repository.root, COMMAND_TIMEOUT);
       await this.extractVerifiedArchive(archivePath, sourceRoot);
       await fs.rm(archivePath, { force: true });
       await inspectExtractedTree(sourceRoot);
@@ -203,15 +224,16 @@ export class UpdateService {
       await assertBuildConfiguration(sourceRoot);
 
       onProgress({ phase: 'staging', percent: 20, message: 'Installing clean staging dependencies…' });
-      await this.runCommand('npm', ['ci', '--ignore-scripts', '--no-audit', '--no-fund', '--userconfig', '/dev/null'], sourceRoot, BUILD_TIMEOUT);
+      await runStagingCommand(this.runCommand, commandEvents, 'npm', ['ci', '--ignore-scripts', '--no-audit', '--no-fund', '--userconfig', '/dev/null'], sourceRoot, BUILD_TIMEOUT);
       onProgress({ phase: 'staging', percent: 45, message: 'Running type checks and the application build…' });
-      await this.runCommand('npm', ['run', 'typecheck'], sourceRoot, BUILD_TIMEOUT);
-      await this.runCommand('npm', ['run', 'package:dir'], sourceRoot, BUILD_TIMEOUT);
+      await runStagingCommand(this.runCommand, commandEvents, 'npm', ['run', 'typecheck'], sourceRoot, BUILD_TIMEOUT);
+      await runStagingCommand(this.runCommand, commandEvents, 'npm', ['run', 'package:dir'], sourceRoot, BUILD_TIMEOUT);
 
       onProgress({ phase: 'staging', percent: 82, message: 'Verifying the staged Apple Silicon application…' });
       const stagedAppPath = await findApplicationBundle(path.join(sourceRoot, 'release'));
       if (!stagedAppPath) throw new Error('The staged build did not produce a lucifold.app bundle.');
       await assertApplicationBundle(stagedAppPath);
+      await assertStableApplicationBundle(stagedAppPath);
       await fs.access(path.dirname(this.options.currentAppPath), fsConstants.W_OK);
 
       const backupRoot = path.join(this.options.userDataPath, 'update-backups', `${tag.slice(1)}-${Date.now()}`);
@@ -243,6 +265,7 @@ export class UpdateService {
       this.launchHelper(this.options.currentExecutable, ['--lucifold-update-helper', planPath], stagingRoot);
       return { accepted: true, message: `lucifold ${plan.newVersion} is verified and will install after the app closes.` };
     } catch (error) {
+      await preserveStagingFailureEvidence(this.options.tempPath, stagingRoot, commandEvents, error);
       if (stagingRoot) await fs.rm(stagingRoot, { recursive: true, force: true }).catch(() => undefined);
       if (lockAcquired) await releaseUpdateLock(lockPath);
       return { accepted: false, message: commandFailureMessage(error, 'The update could not be staged. Your current installation was not changed.') };
@@ -569,7 +592,7 @@ async function assertBuildConfiguration(sourceRoot: string): Promise<void> {
     'build:main': 'tsc -p tsconfig.main.json',
     'build:native': 'node scripts/build-native.mjs',
     typecheck: 'tsc -p tsconfig.json --noEmit && tsc -p tsconfig.main.json --noEmit',
-    'package:dir': 'npm run build && electron-builder --mac --arm64 --dir',
+    'package:dir': 'npm run build && electron-builder --mac --arm64 --dir --publish never',
   };
   for (const [name, expected] of Object.entries(expectedScripts)) {
     if (scripts[name] !== expected) throw new Error(`The staged build script ${name} is not an approved lucifold build command.`);
@@ -755,9 +778,111 @@ async function rejectSymlinks(root: string): Promise<void> {
   }
 }
 
-async function findApplicationBundle(root: string): Promise<string | null> {
+export async function findApplicationBundle(root: string): Promise<string | null> {
+  const expected = path.join(root, 'mac-arm64', 'lucifold.app');
+  try {
+    const stat = await fs.lstat(expected);
+    return stat.isDirectory() && !stat.isSymbolicLink() ? expected : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function assertApplicationBundle(appPath: string): Promise<void> {
+  const bundle = await fs.lstat(appPath);
+  if (!bundle.isDirectory() || bundle.isSymbolicLink()) throw new Error('The staged application bundle is not a trusted directory.');
+  const requiredFiles = [
+    path.join(appPath, 'Contents', 'MacOS', 'lucifold'),
+    path.join(appPath, 'Contents', 'Info.plist'),
+    path.join(appPath, 'Contents', 'Resources', 'app.asar'),
+  ];
+  for (const filePath of requiredFiles) {
+    const stat = await fs.lstat(filePath);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size <= 0) {
+      throw new Error(`The staged application bundle is incomplete or unsafe: ${filePath}`);
+    }
+  }
+}
+
+export async function assertStableApplicationBundle(appPath: string): Promise<void> {
+  await assertApplicationBundle(appPath);
+  const before = await applicationBundleManifest(appPath);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await assertApplicationBundle(appPath);
+  const after = await applicationBundleManifest(appPath);
+  if (before !== after) throw new Error('The staged application bundle changed during verification.');
+}
+
+async function applicationBundleManifest(appPath: string): Promise<string> {
+  const files = [
+    path.join(appPath, 'Contents', 'MacOS', 'lucifold'),
+    path.join(appPath, 'Contents', 'Info.plist'),
+    path.join(appPath, 'Contents', 'Resources', 'app.asar'),
+  ];
+  const manifest = [];
+  for (const filePath of files) {
+    const stat = await fs.stat(filePath);
+    manifest.push({
+      path: path.relative(appPath, filePath),
+      device: stat.dev,
+      inode: stat.ino,
+      size: stat.size,
+      mtimeMs: stat.mtimeMs,
+      mode: stat.mode,
+    });
+  }
+  return JSON.stringify(manifest);
+}
+
+async function runStagingCommand(commandRunner: CommandRunner, events: StagingCommandEvent[], command: string, args: string[], cwd: string | undefined, timeout: number): Promise<CommandResult> {
+  const startedAt = new Date().toISOString();
+  try {
+    const result = await commandRunner(command, args, cwd, timeout);
+    events.push({ command, args, cwd, startedAt, completedAt: result.closedAt ?? new Date().toISOString(), pid: result.pid, exitCode: result.exitCode ?? 0, signal: result.signal ?? null, stdout: truncateDiagnostic(result.stdout), stderr: truncateDiagnostic(result.stderr) });
+    return result;
+  } catch (error) {
+    const details = commandErrorDetails(error);
+    events.push({ command, args, cwd, startedAt, completedAt: new Date().toISOString(), pid: details.pid, exitCode: details.exitCode, signal: details.signal, stdout: truncateDiagnostic(details.stdout), stderr: truncateDiagnostic(details.stderr), error: { name: error instanceof Error ? error.name : 'Error', message: error instanceof Error ? error.message : String(error), exitCode: details.exitCode, signal: details.signal } });
+    throw error;
+  }
+}
+
+function commandErrorDetails(error: unknown): { pid?: number; exitCode?: number | null; signal?: NodeJS.Signals | null; stdout?: string; stderr?: string } {
+  if (!error || typeof error !== 'object') return {};
+  const value = error as Partial<CommandResult>;
+  return { pid: value.pid, exitCode: value.exitCode, signal: value.signal, stdout: value.stdout, stderr: value.stderr };
+}
+
+function truncateDiagnostic(value: string | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  return value.length <= 64 * 1024 ? value : `${value.slice(0, 64 * 1024)}\n[truncated]`;
+}
+
+async function preserveStagingFailureEvidence(tempPath: string, stagingRoot: string | undefined, commandEvents: StagingCommandEvent[], error: unknown): Promise<void> {
+  try {
+    const evidenceRoot = await fs.mkdtemp(path.join(tempPath, 'lucifold-staging-failure-'));
+    const manifest = stagingRoot ? await captureTreeManifest(stagingRoot) : [];
+    const payload = {
+      createdAt: new Date().toISOString(),
+      stagingRoot,
+      commandEvents,
+      error: {
+        name: error instanceof Error ? error.name : 'Error',
+        message: error instanceof Error ? error.message : String(error),
+        ...commandErrorDetails(error),
+      },
+      manifest,
+    };
+    await fs.writeFile(path.join(evidenceRoot, 'staging-failure.json'), JSON.stringify(payload, null, 2), { mode: 0o600 });
+  } catch {
+    // Failure evidence is best effort and must never change the fail-closed result.
+  }
+}
+
+async function captureTreeManifest(root: string): Promise<Array<{ path: string; type: string; size?: number; mtimeMs?: number; mode?: number; nlink?: number }>> {
+  const result: Array<{ path: string; type: string; size?: number; mtimeMs?: number; mode?: number; nlink?: number }> = [];
   const pending = [root];
-  while (pending.length) {
+  while (pending.length && result.length < 10_000) {
     const current = pending.pop() as string;
     let entries: import('node:fs').Dirent[];
     try {
@@ -767,17 +892,19 @@ async function findApplicationBundle(root: string): Promise<string | null> {
     }
     for (const entry of entries) {
       const entryPath = path.join(current, entry.name);
-      if (entry.isDirectory() && entry.name === 'lucifold.app') return entryPath;
-      if (entry.isDirectory() && !entry.isSymbolicLink()) pending.push(entryPath);
+      const relative = path.relative(root, entryPath);
+      try {
+        const stat = await fs.lstat(entryPath);
+        const type = stat.isDirectory() ? 'directory' : stat.isFile() ? 'file' : stat.isSymbolicLink() ? 'symlink' : 'other';
+        result.push({ path: relative, type, size: stat.size, mtimeMs: stat.mtimeMs, mode: stat.mode, nlink: stat.nlink });
+        if (stat.isDirectory() && !stat.isSymbolicLink()) pending.push(entryPath);
+      } catch {
+        result.push({ path: relative, type: 'unavailable' });
+      }
+      if (result.length >= 10_000) break;
     }
   }
-  return null;
-}
-
-export async function assertApplicationBundle(appPath: string): Promise<void> {
-  await fs.access(path.join(appPath, 'Contents', 'MacOS', 'lucifold'));
-  await fs.access(path.join(appPath, 'Contents', 'Info.plist'));
-  await fs.access(path.join(appPath, 'Contents', 'Resources', 'app.asar'));
+  return result.sort((a, b) => a.path.localeCompare(b.path));
 }
 
 function parseVersion(value: string): [number, number, number] | null {
@@ -826,15 +953,39 @@ function commandFailureMessage(error: unknown, fallback: string): string {
 
 function runCommand(command: string, args: string[], cwd?: string, timeout = COMMAND_TIMEOUT): Promise<CommandResult> {
   return new Promise((resolve, reject) => {
-    void Promise.all([resolveControlledExecutable(command), prepareControlledEnvironment()]).then(([executable]) => execFile(executable, args, { cwd, env: controlledChildEnvironment(), timeout, maxBuffer: 8 * 1024 * 1024 }, (error, stdout, stderr) => {
-      if (error) {
-        const wrapped = new Error(String(stderr || stdout || error.message));
-        wrapped.name = error.name;
-        reject(wrapped);
-        return;
-      }
-      resolve({ stdout: String(stdout), stderr: String(stderr) });
-    })).catch(reject);
+    void Promise.all([resolveControlledExecutable(command), prepareControlledEnvironment()]).then(([executable]) => {
+      const startedAt = new Date().toISOString();
+      let exitCode: number | null = null;
+      let signal: NodeJS.Signals | null = null;
+      let exitedAt: string | undefined;
+      let closedAt: string | undefined;
+      const child = execFile(executable, args, { cwd, env: controlledChildEnvironment(), timeout, maxBuffer: 8 * 1024 * 1024 }, (error, stdout, stderr) => {
+        const output = String(stdout);
+        const errors = String(stderr);
+        const result: CommandResult = { stdout: output, stderr: errors, exitCode: exitCode ?? (error ? (typeof error.code === 'number' ? error.code : null) : 0), signal, pid: child.pid, startedAt, exitedAt, closedAt: closedAt ?? new Date().toISOString() };
+        if (error) {
+          const wrapped = Object.assign(new Error(String(errors || output || error.message)), {
+            name: error.name,
+            exitCode: result.exitCode,
+            signal: result.signal,
+            pid: result.pid,
+            stdout: output,
+            stderr: errors,
+          });
+          reject(wrapped);
+          return;
+        }
+        resolve(result);
+      });
+      child.on('exit', (code, childSignal) => {
+        exitCode = code;
+        signal = childSignal;
+        exitedAt = new Date().toISOString();
+      });
+      child.on('close', () => {
+        closedAt = new Date().toISOString();
+      });
+    }).catch(reject);
   });
 }
 

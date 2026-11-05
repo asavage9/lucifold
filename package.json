@@ -1,6 +1,6 @@
 {
   "name": "lucifold",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Local-first macOS image optimization workspace.",
   "author": "Anthony Savage",
   "private": true,
@@ -16,7 +16,7 @@
     "start": "npm run build && electron .",
     "test": "npm run build:native && tsx --test --test-concurrency=1 tests/*.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.main.json --noEmit",
-    "package:dir": "npm run build && electron-builder --mac --arm64 --dir",
+    "package:dir": "npm run build && electron-builder --mac --arm64 --dir --publish never",
     "package:app": "npm run build && electron-builder --mac --arm64 --publish never"
   },
   "dependencies": {
