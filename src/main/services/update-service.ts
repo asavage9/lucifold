@@ -56,6 +56,13 @@ interface StagingCommandEvent {
   error?: { name: string; message: string; exitCode?: number | null; signal?: NodeJS.Signals | null };
 }
 
+export interface BundleValidationAttempt {
+  attempt: number;
+  appPath: string | null;
+  error: string;
+  manifest: Array<{ path: string; type: string; size?: number; mtimeMs?: number; mode?: number; nlink?: number }>;
+}
+
 export interface RepositoryInspection {
   root: string;
   origin: string;
@@ -193,6 +200,7 @@ export class UpdateService {
     let transactionId: string | undefined;
     let transactionAuthorization: string | undefined;
     const commandEvents: StagingCommandEvent[] = [];
+    const bundleValidationAttempts: BundleValidationAttempt[] = [];
     const source = await this.resolveSourceRepository(sourceRepositoryPath);
     if (!source) return { accepted: false, message: 'The trusted local lucifold repository is not configured.' };
 
@@ -227,13 +235,12 @@ export class UpdateService {
       await runStagingCommand(this.runCommand, commandEvents, 'npm', ['ci', '--ignore-scripts', '--no-audit', '--no-fund', '--userconfig', '/dev/null'], sourceRoot, BUILD_TIMEOUT);
       onProgress({ phase: 'staging', percent: 45, message: 'Running type checks and the application build…' });
       await runStagingCommand(this.runCommand, commandEvents, 'npm', ['run', 'typecheck'], sourceRoot, BUILD_TIMEOUT);
-      await runStagingCommand(this.runCommand, commandEvents, 'npm', ['run', 'package:dir'], sourceRoot, BUILD_TIMEOUT);
 
       onProgress({ phase: 'staging', percent: 82, message: 'Verifying the staged Apple Silicon application…' });
-      const stagedAppPath = await findApplicationBundle(path.join(sourceRoot, 'release'));
-      if (!stagedAppPath) throw new Error('The staged build did not produce a lucifold.app bundle.');
-      await assertApplicationBundle(stagedAppPath);
-      await assertStableApplicationBundle(stagedAppPath);
+      const stagedOutput = await verifyStagedApplicationOutput(sourceRoot, async () => {
+        await runStagingCommand(this.runCommand, commandEvents, 'npm', ['run', 'package:dir'], sourceRoot, BUILD_TIMEOUT);
+      }, bundleValidationAttempts);
+      const stagedAppPath = stagedOutput.appPath;
       await fs.access(path.dirname(this.options.currentAppPath), fsConstants.W_OK);
 
       const backupRoot = path.join(this.options.userDataPath, 'update-backups', `${tag.slice(1)}-${Date.now()}`);
@@ -265,7 +272,7 @@ export class UpdateService {
       this.launchHelper(this.options.currentExecutable, ['--lucifold-update-helper', planPath], stagingRoot);
       return { accepted: true, message: `lucifold ${plan.newVersion} is verified and will install after the app closes.` };
     } catch (error) {
-      await preserveStagingFailureEvidence(this.options.tempPath, stagingRoot, commandEvents, error);
+      await preserveStagingFailureEvidence(this.options.tempPath, stagingRoot, commandEvents, error, bundleValidationAttempts);
       if (stagingRoot) await fs.rm(stagingRoot, { recursive: true, force: true }).catch(() => undefined);
       if (lockAcquired) await releaseUpdateLock(lockPath);
       return { accepted: false, message: commandFailureMessage(error, 'The update could not be staged. Your current installation was not changed.') };
@@ -788,6 +795,51 @@ export async function findApplicationBundle(root: string): Promise<string | null
   }
 }
 
+/**
+ * Verify the package output and perform at most one clean rebuild when the
+ * packager exits successfully but leaves an incomplete or unstable bundle.
+ * A second invalid result remains a hard failure; this is recovery from a
+ * known transient output state, not an arbitrary retry loop.
+ */
+export async function verifyStagedApplicationOutput(
+  sourceRoot: string,
+  packageCommand: () => Promise<void>,
+  attempts: BundleValidationAttempt[] = [],
+): Promise<{ appPath: string; attempts: BundleValidationAttempt[] }> {
+  const releaseRoot = path.join(sourceRoot, 'release');
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    await packageCommand();
+    const appPath = await findApplicationBundle(releaseRoot);
+    try {
+      if (!appPath) throw new Error('The staged build did not produce a lucifold.app bundle.');
+      await assertApplicationBundle(appPath);
+      await assertStableApplicationBundle(appPath);
+      return { appPath, attempts };
+    } catch (error) {
+      attempts.push({
+        attempt,
+        appPath,
+        error: error instanceof Error ? error.message : String(error),
+        manifest: await captureTreeManifest(releaseRoot),
+      });
+      if (attempt === 2) throw error;
+      await resetBuildOutput(releaseRoot, sourceRoot);
+    }
+  }
+  throw new Error('The staged application could not be verified.');
+}
+
+async function resetBuildOutput(releaseRoot: string, sourceRoot: string): Promise<void> {
+  if (!isPathWithin(releaseRoot, sourceRoot)) throw new Error('The staging output directory is outside the extracted source tree.');
+  const stat = await fs.lstat(releaseRoot).catch((error: unknown) => {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw error;
+  });
+  if (stat && (!stat.isDirectory() || stat.isSymbolicLink() || hasUntrustedSymlink(releaseRoot))) throw new Error('The staging output directory is not a trusted directory.');
+  await fs.rm(releaseRoot, { recursive: true, force: true });
+  await fs.mkdir(releaseRoot, { recursive: true, mode: 0o700 });
+}
+
 export async function assertApplicationBundle(appPath: string): Promise<void> {
   const bundle = await fs.lstat(appPath);
   if (!bundle.isDirectory() || bundle.isSymbolicLink()) throw new Error('The staged application bundle is not a trusted directory.');
@@ -858,7 +910,7 @@ function truncateDiagnostic(value: string | undefined): string | undefined {
   return value.length <= 64 * 1024 ? value : `${value.slice(0, 64 * 1024)}\n[truncated]`;
 }
 
-async function preserveStagingFailureEvidence(tempPath: string, stagingRoot: string | undefined, commandEvents: StagingCommandEvent[], error: unknown): Promise<void> {
+async function preserveStagingFailureEvidence(tempPath: string, stagingRoot: string | undefined, commandEvents: StagingCommandEvent[], error: unknown, bundleValidationAttempts: BundleValidationAttempt[] = []): Promise<void> {
   try {
     const evidenceRoot = await fs.mkdtemp(path.join(tempPath, 'lucifold-staging-failure-'));
     const manifest = stagingRoot ? await captureTreeManifest(stagingRoot) : [];
@@ -866,6 +918,7 @@ async function preserveStagingFailureEvidence(tempPath: string, stagingRoot: str
       createdAt: new Date().toISOString(),
       stagingRoot,
       commandEvents,
+      bundleValidationAttempts,
       error: {
         name: error instanceof Error ? error.name : 'Error',
         message: error instanceof Error ? error.message : String(error),

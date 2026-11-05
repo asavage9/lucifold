@@ -7,7 +7,7 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import test from 'node:test';
 import { performInstallationForTest, recoverInterruptedUpdate, runUpdateHelper } from '../src/main/services/update-helper.js';
-import { applicationIdentity, assertApplicationBundle, assertStableApplicationBundle, compareVersions, extractVerifiedArchiveForTest, findApplicationBundle, isApprovedTag, isExpectedOrigin, isPathWithin, markUpdateVerified, readUpdateStatus, resolveVerificationUserDataPath, validateArchiveEntries, writeUpdateStatus, UpdateService, type CommandRunner, type UpdatePlan } from '../src/main/services/update-service.js';
+import { applicationIdentity, assertApplicationBundle, assertStableApplicationBundle, compareVersions, extractVerifiedArchiveForTest, findApplicationBundle, isApprovedTag, isExpectedOrigin, isPathWithin, markUpdateVerified, readUpdateStatus, resolveVerificationUserDataPath, validateArchiveEntries, verifyStagedApplicationOutput, writeUpdateStatus, UpdateService, type CommandRunner, type UpdatePlan } from '../src/main/services/update-service.js';
 import { resolveCanonicalApplicationDataPath } from '../src/main/services/application-paths.js';
 import { parseUpdaterArguments } from '../src/main/services/verification-arguments.js';
 
@@ -126,12 +126,45 @@ test('staging validation requires the exact complete arm64 bundle and rejects in
   await assert.doesNotReject(assertApplicationBundle(expected));
   await assert.doesNotReject(assertStableApplicationBundle(expected));
   await fs.rm(path.join(expected, 'Contents', 'Resources', 'app.asar'));
-  const delayedOutput = Promise.resolve().then(() => fs.writeFile(path.join(expected, 'Contents', 'Resources', 'app.asar'), 'delayed-output'));
   await assert.rejects(assertStableApplicationBundle(expected), /incomplete|ENOENT/i);
-  await delayedOutput;
+  await fs.writeFile(path.join(expected, 'Contents', 'Resources', 'app.asar'), 'delayed-output');
   const relocated = path.join(releaseRoot, 'mac-x64', 'lucifold.app');
   await createFixtureApp(relocated, 'exit 0', 'relocated');
   assert.equal(await findApplicationBundle(releaseRoot), expected);
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test('staging performs one clean rebuild after an incomplete successful package and preserves the failed manifest', async () => {
+  const root = await temporaryDirectory('lucifold-staging-recovery-');
+  const expected = path.join(root, 'release', 'mac-arm64', 'lucifold.app');
+  let packageAttempts = 0;
+  const result = await verifyStagedApplicationOutput(root, async () => {
+    packageAttempts += 1;
+    if (packageAttempts === 1) {
+      await fs.mkdir(path.join(expected, 'Contents', 'MacOS'), { recursive: true });
+      await fs.mkdir(path.join(expected, 'Contents', 'Resources', 'app.asar'), { recursive: true });
+      await fs.writeFile(path.join(expected, 'Contents', 'MacOS', 'lucifold'), '#!/bin/sh\nexit 0\n');
+      await fs.writeFile(path.join(expected, 'Contents', 'Info.plist'), 'incomplete');
+      return;
+    }
+    await createFixtureApp(expected, 'exit 0', 'recovered');
+  });
+  assert.equal(packageAttempts, 2);
+  assert.equal(result.appPath, expected);
+  assert.equal(result.attempts.length, 1);
+  assert.match(result.attempts[0].error, /incomplete|regular file/i);
+  assert.equal(result.attempts[0].manifest.find((entry) => entry.path.endsWith('Contents/Resources/app.asar'))?.type, 'directory');
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test('staging fails closed after the bounded rebuild if output remains relocated', async () => {
+  const root = await temporaryDirectory('lucifold-staging-recovery-failure-');
+  let packageAttempts = 0;
+  await assert.rejects(verifyStagedApplicationOutput(root, async () => {
+    packageAttempts += 1;
+    await createFixtureApp(path.join(root, 'release', 'mac-x64', 'lucifold.app'), 'exit 0', `relocated-${packageAttempts}`);
+  }), /did not produce|could not be verified/i);
+  assert.equal(packageAttempts, 2);
   await fs.rm(root, { recursive: true, force: true });
 });
 
