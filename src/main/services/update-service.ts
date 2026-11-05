@@ -48,7 +48,10 @@ interface StagingCommandEvent {
   cwd?: string;
   startedAt: string;
   completedAt: string;
+  exitedAt?: string;
+  closedAt?: string;
   pid?: number;
+  pidAliveAfterClose?: boolean;
   exitCode?: number | null;
   signal?: NodeJS.Signals | null;
   stdout?: string;
@@ -61,6 +64,13 @@ export interface BundleValidationAttempt {
   appPath: string | null;
   error: string;
   manifest: Array<{ path: string; type: string; size?: number; mtimeMs?: number; mode?: number; nlink?: number }>;
+}
+
+export interface QuarantineCleanupDiagnostic {
+  quarantineRoot: string;
+  attempts: number;
+  cleaned: boolean;
+  errors: string[];
 }
 
 export interface RepositoryInspection {
@@ -201,6 +211,7 @@ export class UpdateService {
     let transactionAuthorization: string | undefined;
     const commandEvents: StagingCommandEvent[] = [];
     const bundleValidationAttempts: BundleValidationAttempt[] = [];
+    let quarantineCleanup: QuarantineCleanupDiagnostic[] = [];
     const source = await this.resolveSourceRepository(sourceRepositoryPath);
     if (!source) return { accepted: false, message: 'The trusted local lucifold repository is not configured.' };
 
@@ -239,7 +250,8 @@ export class UpdateService {
       onProgress({ phase: 'staging', percent: 82, message: 'Verifying the staged Apple Silicon application…' });
       const stagedOutput = await verifyStagedApplicationOutput(sourceRoot, async () => {
         await runStagingCommand(this.runCommand, commandEvents, 'npm', ['run', 'package:dir'], sourceRoot, BUILD_TIMEOUT);
-      }, bundleValidationAttempts);
+      }, bundleValidationAttempts, quarantineCleanup);
+      quarantineCleanup = stagedOutput.quarantineCleanup;
       const stagedAppPath = stagedOutput.appPath;
       await fs.access(path.dirname(this.options.currentAppPath), fsConstants.W_OK);
 
@@ -272,7 +284,7 @@ export class UpdateService {
       this.launchHelper(this.options.currentExecutable, ['--lucifold-update-helper', planPath], stagingRoot);
       return { accepted: true, message: `lucifold ${plan.newVersion} is verified and will install after the app closes.` };
     } catch (error) {
-      await preserveStagingFailureEvidence(this.options.tempPath, stagingRoot, commandEvents, error, bundleValidationAttempts);
+      await preserveStagingFailureEvidence(this.options.tempPath, stagingRoot, commandEvents, error, bundleValidationAttempts, quarantineCleanup);
       if (stagingRoot) await fs.rm(stagingRoot, { recursive: true, force: true }).catch(() => undefined);
       if (lockAcquired) await releaseUpdateLock(lockPath);
       return { accepted: false, message: commandFailureMessage(error, 'The update could not be staged. Your current installation was not changed.') };
@@ -805,16 +817,20 @@ export async function verifyStagedApplicationOutput(
   sourceRoot: string,
   packageCommand: () => Promise<void>,
   attempts: BundleValidationAttempt[] = [],
-): Promise<{ appPath: string; attempts: BundleValidationAttempt[] }> {
+  quarantineCleanup: QuarantineCleanupDiagnostic[] = [],
+): Promise<{ appPath: string; attempts: BundleValidationAttempt[]; quarantineCleanup: QuarantineCleanupDiagnostic[] }> {
   const releaseRoot = path.join(sourceRoot, 'release');
+  const quarantineRoots: string[] = [];
   for (let attempt = 1; attempt <= 2; attempt += 1) {
-    await packageCommand();
-    const appPath = await findApplicationBundle(releaseRoot);
+    let appPath: string | null = null;
     try {
+      await packageCommand();
+      appPath = await findApplicationBundle(releaseRoot);
       if (!appPath) throw new Error('The staged build did not produce a lucifold.app bundle.');
       await assertApplicationBundle(appPath);
       await assertStableApplicationBundle(appPath);
-      return { appPath, attempts };
+      quarantineCleanup.push(...await cleanupQuarantineRoots(quarantineRoots));
+      return { appPath, attempts, quarantineCleanup };
     } catch (error) {
       attempts.push({
         attempt,
@@ -822,34 +838,56 @@ export async function verifyStagedApplicationOutput(
         error: error instanceof Error ? error.message : String(error),
         manifest: await captureTreeManifest(releaseRoot),
       });
-      if (attempt === 2) throw error;
-      await resetBuildOutput(releaseRoot, sourceRoot);
+      if (attempt === 2) {
+        quarantineCleanup.push(...await cleanupQuarantineRoots(quarantineRoots));
+        throw error;
+      }
+      const quarantineRoot = await resetBuildOutput(releaseRoot, sourceRoot);
+      if (quarantineRoot) quarantineRoots.push(quarantineRoot);
     }
   }
   throw new Error('The staged application could not be verified.');
 }
 
-async function resetBuildOutput(releaseRoot: string, sourceRoot: string): Promise<void> {
+async function resetBuildOutput(releaseRoot: string, sourceRoot: string): Promise<string | undefined> {
   if (!isPathWithin(releaseRoot, sourceRoot)) throw new Error('The staging output directory is outside the extracted source tree.');
   const stat = await fs.lstat(releaseRoot).catch((error: unknown) => {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
     throw error;
   });
   if (stat && (!stat.isDirectory() || stat.isSymbolicLink() || hasUntrustedSymlink(releaseRoot))) throw new Error('The staging output directory is not a trusted directory.');
+  let quarantineRoot: string | undefined;
   if (stat) {
-    // Quarantine the complete invalid output before deleting it. This avoids
-    // recursively removing a directory while the packager may still have
-    // open handles or be traversing its populated bundle on macOS.
-    const quarantineRoot = path.join(sourceRoot, `.lucifold-release-reset-${randomUUID()}`);
+    // Move the complete invalid output out of the source tree first. The
+    // rebuild must never wait for recursive cleanup of a populated bundle.
+    quarantineRoot = path.join(path.dirname(sourceRoot), `.lucifold-release-reset-${randomUUID()}`);
+    if (!isPathWithin(quarantineRoot, path.dirname(sourceRoot))) throw new Error('The quarantine directory is outside the staging directory.');
     await fs.rename(releaseRoot, quarantineRoot);
-    try {
-      await fs.rm(quarantineRoot, { recursive: true, force: true });
-    } catch (error) {
-      await fs.rename(quarantineRoot, releaseRoot).catch(() => undefined);
-      throw error;
-    }
   }
   await fs.mkdir(releaseRoot, { recursive: true, mode: 0o700 });
+  return quarantineRoot;
+}
+
+async function cleanupQuarantineRoots(quarantineRoots: string[]): Promise<QuarantineCleanupDiagnostic[]> {
+  const diagnostics: QuarantineCleanupDiagnostic[] = [];
+  for (const quarantineRoot of quarantineRoots) {
+    const errors: string[] = [];
+    let cleaned = false;
+    let attempts = 0;
+    for (; attempts < 2; attempts += 1) {
+      try {
+        await fs.rm(quarantineRoot, { recursive: true, force: true });
+        cleaned = true;
+        break;
+      } catch (error) {
+        errors.push(error instanceof Error ? error.message : String(error));
+      }
+    }
+    const diagnostic = { quarantineRoot, attempts, cleaned, errors };
+    diagnostics.push(diagnostic);
+    if (!cleaned) console.warn(`lucifold staging quarantine cleanup deferred: ${JSON.stringify(diagnostic)}`);
+  }
+  return diagnostics;
 }
 
 export async function assertApplicationBundle(appPath: string): Promise<void> {
@@ -902,12 +940,21 @@ async function runStagingCommand(commandRunner: CommandRunner, events: StagingCo
   const startedAt = new Date().toISOString();
   try {
     const result = await commandRunner(command, args, cwd, timeout);
-    events.push({ command, args, cwd, startedAt, completedAt: result.closedAt ?? new Date().toISOString(), pid: result.pid, exitCode: result.exitCode ?? 0, signal: result.signal ?? null, stdout: truncateDiagnostic(result.stdout), stderr: truncateDiagnostic(result.stderr) });
+    events.push({ command, args, cwd, startedAt, completedAt: result.closedAt ?? new Date().toISOString(), exitedAt: result.exitedAt, closedAt: result.closedAt, pid: result.pid, pidAliveAfterClose: result.pid === undefined ? undefined : isProcessAlive(result.pid), exitCode: result.exitCode ?? 0, signal: result.signal ?? null, stdout: truncateDiagnostic(result.stdout), stderr: truncateDiagnostic(result.stderr) });
     return result;
   } catch (error) {
     const details = commandErrorDetails(error);
-    events.push({ command, args, cwd, startedAt, completedAt: new Date().toISOString(), pid: details.pid, exitCode: details.exitCode, signal: details.signal, stdout: truncateDiagnostic(details.stdout), stderr: truncateDiagnostic(details.stderr), error: { name: error instanceof Error ? error.name : 'Error', message: error instanceof Error ? error.message : String(error), exitCode: details.exitCode, signal: details.signal } });
+    events.push({ command, args, cwd, startedAt, completedAt: new Date().toISOString(), pid: details.pid, pidAliveAfterClose: details.pid === undefined ? undefined : isProcessAlive(details.pid), exitCode: details.exitCode, signal: details.signal, stdout: truncateDiagnostic(details.stdout), stderr: truncateDiagnostic(details.stderr), error: { name: error instanceof Error ? error.name : 'Error', message: error instanceof Error ? error.message : String(error), exitCode: details.exitCode, signal: details.signal } });
     throw error;
+  }
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
   }
 }
 
@@ -922,7 +969,7 @@ function truncateDiagnostic(value: string | undefined): string | undefined {
   return value.length <= 64 * 1024 ? value : `${value.slice(0, 64 * 1024)}\n[truncated]`;
 }
 
-async function preserveStagingFailureEvidence(tempPath: string, stagingRoot: string | undefined, commandEvents: StagingCommandEvent[], error: unknown, bundleValidationAttempts: BundleValidationAttempt[] = []): Promise<void> {
+async function preserveStagingFailureEvidence(tempPath: string, stagingRoot: string | undefined, commandEvents: StagingCommandEvent[], error: unknown, bundleValidationAttempts: BundleValidationAttempt[] = [], quarantineCleanup: QuarantineCleanupDiagnostic[] = []): Promise<void> {
   try {
     const evidenceRoot = await fs.mkdtemp(path.join(tempPath, 'lucifold-staging-failure-'));
     const manifest = stagingRoot ? await captureTreeManifest(stagingRoot) : [];
@@ -931,6 +978,7 @@ async function preserveStagingFailureEvidence(tempPath: string, stagingRoot: str
       stagingRoot,
       commandEvents,
       bundleValidationAttempts,
+      quarantineCleanup,
       error: {
         name: error instanceof Error ? error.name : 'Error',
         message: error instanceof Error ? error.message : String(error),

@@ -163,9 +163,46 @@ test('staging performs one clean rebuild after an incomplete successful package 
   assert.equal(packageAttempts, 2);
   assert.equal(result.appPath, expected);
   assert.equal(result.attempts.length, 1);
+  assert.equal(result.quarantineCleanup.length, 1);
   assert.match(result.attempts[0].error, /incomplete|regular file/i);
   assert.equal(result.attempts[0].manifest.find((entry) => entry.path.endsWith('Contents/Resources/app.asar'))?.type, 'directory');
   await fs.rm(root, { recursive: true, force: true });
+});
+
+test('staging rebuild proceeds while quarantined output files are actively changing', async () => {
+  const root = await temporaryDirectory('lucifold-staging-active-quarantine-');
+  const expected = path.join(root, 'release', 'mac-arm64', 'lucifold.app');
+  let packageAttempts = 0;
+  let writer: NodeJS.Timeout | undefined;
+  let partialHandle: import('node:fs/promises').FileHandle | undefined;
+  let partialPath = '';
+  try {
+    const result = await verifyStagedApplicationOutput(root, async () => {
+      packageAttempts += 1;
+      if (packageAttempts === 1) {
+        await fs.mkdir(path.join(expected, 'Contents', 'MacOS'), { recursive: true });
+        await fs.mkdir(path.join(expected, 'Contents', 'Resources', 'app.asar'), { recursive: true });
+        await fs.writeFile(path.join(expected, 'Contents', 'MacOS', 'lucifold'), '#!/bin/sh\nexit 0\n');
+        await fs.writeFile(path.join(expected, 'Contents', 'Info.plist'), 'incomplete');
+        partialPath = path.join(expected, 'Contents', 'Resources', 'app.asar', 'partial.bin');
+        await fs.writeFile(partialPath, 'partial');
+        partialHandle = await fs.open(partialPath, 'a');
+        writer = setInterval(() => { void partialHandle?.write('.').catch(() => undefined); }, 1);
+        return;
+      }
+      await createFixtureApp(expected, 'exit 0', 'recovered-active');
+    });
+    assert.equal(packageAttempts, 2);
+    assert.equal(result.appPath, expected);
+    assert.equal(result.attempts.length, 1);
+    assert.equal(result.quarantineCleanup.length, 1);
+    assert.equal(result.quarantineCleanup[0].attempts <= 2, true);
+    await assert.doesNotReject(assertApplicationBundle(expected));
+  } finally {
+    if (writer) clearInterval(writer);
+    await partialHandle?.close().catch(() => undefined);
+    await fs.rm(root, { recursive: true, force: true });
+  }
 });
 
 test('staging fails closed after the bounded rebuild if output remains relocated', async () => {
