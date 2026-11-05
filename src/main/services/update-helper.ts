@@ -3,7 +3,7 @@ import { spawn } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
-import { applicationIdentity, assertApplicationBundle, isApprovedTag, isPathWithin, readUpdateStatus, releaseUpdateLock, syncDirectory, UPDATE_PLAN_VERSION, writeUpdateStatus, type UpdatePlan } from './update-service.js';
+import { applicationIdentity, assertApplicationBundle, isApprovedTag, isPathWithin, isProtectedEverydayApplicationPath, readUpdateStatus, releaseUpdateLock, syncDirectory, UPDATE_PLAN_VERSION, writeUpdateStatus, type UpdatePlan } from './update-service.js';
 
 const PARENT_EXIT_TIMEOUT = 60_000;
 const STARTUP_VERIFY_TIMEOUT = 45_000;
@@ -139,6 +139,7 @@ async function recoverStaleLockWithoutStatus(userDataPath: string): Promise<void
 
 function validatePlan(plan: UpdatePlan, expectedAppPath?: string, requireTransaction = false, expectedUserDataPath?: string): void {
   if (!plan || plan.version !== UPDATE_PLAN_VERSION || !Number.isInteger(plan.parentPid) || plan.parentPid <= 0 || !isApprovedTag(`v${plan.newVersion}`) || !plan.targetAppPath?.endsWith('.app') || !plan.stagedAppPath?.endsWith('.app') || !plan.stagingRoot || !plan.userDataPath || !plan.backupRoot || !plan.backupPath || !plan.lockPath || !plan.statusPath || !plan.targetExecutable || [plan.targetAppPath, plan.stagedAppPath, plan.stagingRoot, plan.userDataPath, plan.backupRoot, plan.backupPath, plan.lockPath, plan.statusPath, plan.targetExecutable].some((value) => !path.isAbsolute(value))) throw new Error('The update plan is invalid.');
+  if (isProtectedEverydayApplicationPath(plan.targetAppPath)) throw new Error('The update plan targets the protected everyday lucifold installation.');
   if (expectedAppPath && path.resolve(plan.targetAppPath) !== path.resolve(expectedAppPath)) throw new Error('The update plan does not target the running lucifold application.');
   if (expectedUserDataPath && path.resolve(plan.userDataPath) !== path.resolve(expectedUserDataPath)) throw new Error('The update plan does not target the running lucifold user-data directory.');
   if (!path.basename(plan.stagingRoot).startsWith('lucifold-update-')) throw new Error('The staging directory is not an approved temporary update directory.');
