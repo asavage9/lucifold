@@ -167,6 +167,7 @@ test('staging performs one clean rebuild after an incomplete successful package 
     if (packageAttempts === 1) {
       await fs.mkdir(path.join(expected, 'Contents', 'MacOS'), { recursive: true });
       await fs.mkdir(path.join(expected, 'Contents', 'Resources', 'app.asar'), { recursive: true });
+      await fs.writeFile(path.join(expected, 'Contents', 'Resources', 'app.asar', 'partial.bin'), 'partial output');
       await fs.writeFile(path.join(expected, 'Contents', 'MacOS', 'lucifold'), '#!/bin/sh\nexit 0\n');
       await fs.writeFile(path.join(expected, 'Contents', 'Info.plist'), 'incomplete');
       return;
