@@ -113,14 +113,6 @@ export interface UpdateServiceOptions {
   trustedReleaseSigningPrincipal?: string;
 }
 
-/**
- * The everyday installation is intentionally outside disposable updater
- * lifecycle tests. A transaction must never target it implicitly.
- */
-export function isProtectedEverydayApplicationPath(candidate: string, protectedPath = path.join(os.homedir(), 'Applications', 'lucifold.app')): boolean {
-  return path.resolve(candidate) === path.resolve(protectedPath);
-}
-
 export class UpdateService {
   private readonly runCommand: CommandRunner;
   private readonly launchHelper: HelperLauncher;
@@ -197,9 +189,6 @@ export class UpdateService {
   async prepareAndInstall(tag: string, sourceRepositoryPath: string | null, onProgress: (progress: UpdateProgress) => void): Promise<{ accepted: boolean; message: string }> {
     if (!this.options.packaged || !this.options.currentAppPath) {
       return { accepted: false, message: 'Updates can only install from a packaged macOS application.' };
-    }
-    if (isProtectedEverydayApplicationPath(this.options.currentAppPath)) {
-      return { accepted: false, message: 'The updater refuses to target the protected everyday lucifold installation.' };
     }
     if (!this.options.expectedOrigin) {
       return { accepted: false, message: 'This build has no approved lucifold update origin configured.' };

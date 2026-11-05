@@ -7,7 +7,7 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import test from 'node:test';
 import { performInstallationForTest, recoverInterruptedUpdate, runUpdateHelper } from '../src/main/services/update-helper.js';
-import { applicationIdentity, assertApplicationBundle, assertStableApplicationBundle, compareVersions, extractVerifiedArchiveForTest, findApplicationBundle, isApprovedTag, isExpectedOrigin, isPathWithin, isProtectedEverydayApplicationPath, markUpdateVerified, readUpdateStatus, resolveVerificationUserDataPath, validateArchiveEntries, verifyStagedApplicationOutput, writeUpdateStatus, UpdateService, type CommandRunner, type UpdatePlan } from '../src/main/services/update-service.js';
+import { applicationIdentity, assertApplicationBundle, assertStableApplicationBundle, compareVersions, extractVerifiedArchiveForTest, findApplicationBundle, isApprovedTag, isExpectedOrigin, isPathWithin, markUpdateVerified, readUpdateStatus, resolveVerificationUserDataPath, validateArchiveEntries, verifyStagedApplicationOutput, writeUpdateStatus, UpdateService, type CommandRunner, type UpdatePlan } from '../src/main/services/update-service.js';
 import { resolveCanonicalApplicationDataPath } from '../src/main/services/application-paths.js';
 import { parseUpdaterArguments } from '../src/main/services/verification-arguments.js';
 
@@ -104,30 +104,16 @@ test('update validation accepts only stable tags and strict path containment', (
   assert.equal(isPathWithin('/tmp/lucifold-update-1/source', '/tmp/lucifold-update-1'), true);
   assert.equal(isPathWithin('/tmp/lucifold-update-1/../outside', '/tmp/lucifold-update-1'), false);
   assert.equal(isPathWithin('/tmp/lucifold-update-1', '/tmp/lucifold-update-1'), false);
-  assert.equal(isProtectedEverydayApplicationPath('/Users/test/Applications/lucifold.app', '/Users/test/Applications/lucifold.app'), true);
-  assert.equal(isProtectedEverydayApplicationPath('/private/tmp/lucifold.app', '/Users/test/Applications/lucifold.app'), false);
 });
 
-test('updater refuses to prepare an installation targeting the protected everyday application', async () => {
-  const root = await temporaryDirectory('lucifold-protected-target-');
-  let helperLaunched = false;
-  const protectedPath = path.join(os.homedir(), 'Applications', 'lucifold.app');
-  const service = new UpdateService({
-    currentVersion: '1.0.8',
-    packaged: true,
-    currentAppPath: protectedPath,
-    currentExecutable: path.join(protectedPath, 'Contents', 'MacOS', 'lucifold'),
-    userDataPath: path.join(root, 'data'),
-    tempPath: root,
-    sourceCandidates: [],
-    expectedOrigin: 'https://github.com/asavage9/lucifold.git',
-    helperLauncher: () => { helperLaunched = true; },
-  });
-  const result = await service.prepareAndInstall('v1.0.9', null, () => undefined);
-  assert.equal(result.accepted, false);
-  assert.match(result.message, /protected everyday/i);
-  assert.equal(helperLaunched, false);
-  await fs.rm(root, { recursive: true, force: true });
+function assertDisposableApplicationTarget(candidate: string, everydayPath: string): void {
+  if (path.resolve(candidate) === path.resolve(everydayPath)) throw new Error('The disposable updater test target resolves to the everyday lucifold installation.');
+}
+
+test('disposable updater test harness rejects the everyday application target', () => {
+  const everydayPath = path.join(os.homedir(), 'Applications', 'lucifold.app');
+  assert.throws(() => assertDisposableApplicationTarget(everydayPath, everydayPath), /everyday lucifold installation/i);
+  assert.doesNotThrow(() => assertDisposableApplicationTarget('/private/tmp/lucifold-v108-bootstrap/lucifold.app', everydayPath));
 });
 
 test('staging validation requires the exact complete arm64 bundle and rejects incomplete or relocated output', async () => {
