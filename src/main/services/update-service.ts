@@ -1,4 +1,4 @@
-import { constants as fsConstants, closeSync, fstatSync, ftruncateSync, fsyncSync, openSync, promises as fs, readFileSync, lstatSync, realpathSync, writeSync } from 'node:fs';
+import { constants as fsConstants, closeSync, fstatSync, ftruncateSync, fsyncSync, openSync, promises as fs, readFileSync, lstatSync, realpathSync, writeSync, type Stats } from 'node:fs';
 import { execFile, spawn } from 'node:child_process';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import os from 'node:os';
@@ -707,21 +707,13 @@ export async function syncDirectory(directoryPath: string): Promise<void> {
 export async function applicationIdentity(appPath: string): Promise<string> {
   const files = ['Contents/MacOS/lucifold', 'Contents/Info.plist', 'Contents/Resources/app.asar'];
   const digest = createHash('sha256');
-  const electronProcess = process as NodeJS.Process & { noAsar?: boolean };
-  const usesElectronAsar = typeof process.versions.electron === 'string';
-  const previousNoAsar = electronProcess.noAsar;
-  if (usesElectronAsar) electronProcess.noAsar = true;
-  try {
-    for (const relativePath of files) {
-      const filePath = path.join(appPath, relativePath);
-      const stat = lstatSync(filePath);
-      if (!stat.isFile()) throw new Error(`The application bundle entry ${relativePath} is not a regular file.`);
-      digest.update(relativePath);
-      digest.update(String(stat.size));
-      digest.update(readFileSync(filePath));
-    }
-  } finally {
-    if (usesElectronAsar) electronProcess.noAsar = previousNoAsar;
+  for (const relativePath of files) {
+    const filePath = path.join(appPath, relativePath);
+    const stat = lstatBundleEntry(filePath);
+    if (!stat.isFile()) throw new Error(`The application bundle entry ${relativePath} is not a regular file.`);
+    digest.update(relativePath);
+    digest.update(String(stat.size));
+    digest.update(readBundleEntry(filePath));
   }
   return digest.digest('hex');
 }
@@ -907,7 +899,7 @@ export async function assertApplicationBundle(appPath: string): Promise<void> {
     path.join(appPath, 'Contents', 'Resources', 'app.asar'),
   ];
   for (const filePath of requiredFiles) {
-    const stat = await fs.lstat(filePath);
+    const stat = lstatBundleEntry(filePath);
     if (!stat.isFile() || stat.isSymbolicLink() || stat.size <= 0) {
       throw new Error(`The staged application bundle is incomplete or unsafe: ${filePath}`);
     }
@@ -931,7 +923,7 @@ async function applicationBundleManifest(appPath: string): Promise<string> {
   ];
   const manifest = [];
   for (const filePath of files) {
-    const stat = await fs.stat(filePath);
+    const stat = statBundleEntry(filePath);
     manifest.push({
       path: path.relative(appPath, filePath),
       device: stat.dev,
@@ -942,6 +934,30 @@ async function applicationBundleManifest(appPath: string): Promise<string> {
     });
   }
   return JSON.stringify(manifest);
+}
+
+function lstatBundleEntry(filePath: string): Stats {
+  return withAsarDisabled(() => lstatSync(filePath));
+}
+
+function statBundleEntry(filePath: string): Stats {
+  return withAsarDisabled(() => lstatSync(filePath));
+}
+
+function readBundleEntry(filePath: string): Buffer {
+  return withAsarDisabled(() => readFileSync(filePath));
+}
+
+function withAsarDisabled<T>(operation: () => T): T {
+  const electronProcess = process as NodeJS.Process & { noAsar?: boolean };
+  if (typeof process.versions.electron !== 'string') return operation();
+  const previousNoAsar = electronProcess.noAsar;
+  electronProcess.noAsar = true;
+  try {
+    return operation();
+  } finally {
+    electronProcess.noAsar = previousNoAsar;
+  }
 }
 
 async function runStagingCommand(commandRunner: CommandRunner, events: StagingCommandEvent[], command: string, args: string[], cwd: string | undefined, timeout: number): Promise<CommandResult> {
