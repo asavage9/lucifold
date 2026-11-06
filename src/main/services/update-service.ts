@@ -707,13 +707,21 @@ export async function syncDirectory(directoryPath: string): Promise<void> {
 export async function applicationIdentity(appPath: string): Promise<string> {
   const files = ['Contents/MacOS/lucifold', 'Contents/Info.plist', 'Contents/Resources/app.asar'];
   const digest = createHash('sha256');
-  for (const relativePath of files) {
-    const filePath = path.join(appPath, relativePath);
-    const stat = await fs.lstat(filePath);
-    if (!stat.isFile()) throw new Error(`The application bundle entry ${relativePath} is not a regular file.`);
-    digest.update(relativePath);
-    digest.update(String(stat.size));
-    digest.update(await fs.readFile(filePath));
+  const electronProcess = process as NodeJS.Process & { noAsar?: boolean };
+  const usesElectronAsar = typeof process.versions.electron === 'string';
+  const previousNoAsar = electronProcess.noAsar;
+  if (usesElectronAsar) electronProcess.noAsar = true;
+  try {
+    for (const relativePath of files) {
+      const filePath = path.join(appPath, relativePath);
+      const stat = lstatSync(filePath);
+      if (!stat.isFile()) throw new Error(`The application bundle entry ${relativePath} is not a regular file.`);
+      digest.update(relativePath);
+      digest.update(String(stat.size));
+      digest.update(readFileSync(filePath));
+    }
+  } finally {
+    if (usesElectronAsar) electronProcess.noAsar = previousNoAsar;
   }
   return digest.digest('hex');
 }
